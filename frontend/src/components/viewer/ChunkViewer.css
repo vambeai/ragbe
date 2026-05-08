@@ -25,6 +25,29 @@
   transform: none;
 }
 
+/* Re-run the chunker against the current Markdown — green palette
+   inherited from the previous "Reconvert" button so the action reads as
+   "regenerate" without inventing a new colour. */
+.md-action-btn.rechunk {
+  background: white;
+  border: 1.5px solid rgba(61, 107, 39, 0.3);
+  color: #3D6B27;
+  box-shadow: 0 1px 4px rgba(61, 107, 39, 0.1);
+}
+
+.md-action-btn.rechunk:hover:not(:disabled) {
+  background: linear-gradient(135deg, #3D6B27 0%, #5A8C3E 100%);
+  border-color: transparent;
+  color: white;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(61, 107, 39, 0.3);
+}
+
+.md-action-btn.rechunk:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .md-action-btn.cancel-chunking {
   background: transparent;
   border: 1.5px solid rgba(139, 69, 19, 0.4);

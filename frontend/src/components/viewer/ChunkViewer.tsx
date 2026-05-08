@@ -5,6 +5,14 @@ import type { Chunk, EnrichmentSettings } from '../../types'
 import { useChunkEnrichment } from '../../hooks/useChunkEnrichment'
 import { useScrollSync } from '../../hooks/useScrollSync'
 import { isChunkEnriched } from '../../utils/chunkUtils'
+import {
+  CHUNK_BORDER_COLORS,
+  CHUNK_COLORS,
+  CHUNK_HEIGHT_MAX_PX,
+  CHUNK_HEIGHT_MIN_PX,
+  CHUNK_HEIGHT_PX_PER_CHAR,
+  LAZY_OBSERVER_MARGIN,
+} from '../../config'
 import ChunkEditModal from '../chunks/ChunkEditModal'
 import ProgressModal from '../modals/ProgressModal'
 import './MarkdownViewer.css'
@@ -25,6 +33,10 @@ interface Props {
   onDeleteChunks: (indices: Set<number>) => void
   onMergeChunks: (indices: number[]) => void
   onSaveChunks: () => void
+  onRechunk: () => void
+  /** Active chunker token, displayed on the Re-chunk button so the label
+   *  mirrors the "Convert with {converter}" pattern in the MD viewer. */
+  chunkerLabel: string
   onEnrichSuccess?: (msg: string) => void
   onEnrichError?: (msg: string) => void
 }
@@ -48,7 +60,7 @@ function LazyChunk({ children, estimatedHeight }: { children: ReactNode; estimat
           observer.disconnect()
         }
       },
-      { rootMargin: '300px' },
+      { rootMargin: LAZY_OBSERVER_MARGIN },
     )
     observer.observe(el)
     return () => observer.disconnect()
@@ -57,19 +69,6 @@ function LazyChunk({ children, estimatedHeight }: { children: ReactNode; estimat
   if (visible) return <>{children}</>
   return <div ref={ref} style={{ minHeight: estimatedHeight }} />
 }
-
-const CHUNK_COLORS = [
-  'rgba(139, 69, 19, 0.12)', 'rgba(61, 107, 39, 0.12)', 'rgba(204, 34, 0, 0.09)',
-  'rgba(180, 140, 60, 0.15)', 'rgba(30, 90, 140, 0.10)', 'rgba(210, 105, 30, 0.13)',
-  'rgba(90, 50, 120, 0.09)', 'rgba(20, 110, 100, 0.11)', 'rgba(160, 60, 30, 0.12)',
-  'rgba(60, 120, 60, 0.12)',
-]
-
-const CHUNK_BORDER_COLORS = [
-  '#8B4513', '#3D6B27', '#CC2200', '#B48C3C', '#1E5A8C',
-  '#D2691E', '#5A3278', '#146E64', '#A03C1E', '#3C783C',
-]
-
 
 type PendingOp =
   | { type: 'delete-single'; index: number }
@@ -90,6 +89,8 @@ function ChunkViewer({
   onDeleteChunks,
   onMergeChunks,
   onSaveChunks,
+  onRechunk,
+  chunkerLabel,
   onEnrichSuccess,
   onEnrichError,
 }: Props) {
@@ -291,6 +292,14 @@ function ChunkViewer({
         </div>
         <div className="md-controls-right">
           <button
+            className="md-action-btn rechunk"
+            onClick={onRechunk}
+            disabled={chunking || savingChunks}
+            title={`Re-run the chunker over the displayed Markdown (${chunkerLabel})`}
+          >
+            <span>↻</span> Re-chunk with {chunkerLabel}
+          </button>
+          <button
             className="md-action-btn save-chunks"
             onClick={onSaveChunks}
             disabled={!chunksReady || savingChunks || chunking}
@@ -325,7 +334,10 @@ function ChunkViewer({
               const enriched = isChunkEnriched(chunk)
               // Estimate height from content length so the placeholder approximates
               // the real height and minimises scroll-position jumps on reveal.
-              const estimatedHeight = Math.max(100, Math.min(800, chunk.content.length * 0.4))
+              const estimatedHeight = Math.max(
+                CHUNK_HEIGHT_MIN_PX,
+                Math.min(CHUNK_HEIGHT_MAX_PX, chunk.content.length * CHUNK_HEIGHT_PX_PER_CHAR),
+              )
               return (
                 <LazyChunk key={chunk.index} estimatedHeight={estimatedHeight}>
                 <div

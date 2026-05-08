@@ -16,8 +16,8 @@ from backend.config import get_settings
 
 
 async def escalate_kill(procs: list, label: str = "Worker process") -> None:
-    """Send SIGKILL to any worker still alive 3 s after SIGTERM."""
-    await asyncio.sleep(3.0)
+    """Send SIGKILL to any worker still alive after the configured grace period."""
+    await asyncio.sleep(get_settings().WORKER_SIGKILL_DELAY_S)
     for p in procs:
         if p.is_alive():
             try:

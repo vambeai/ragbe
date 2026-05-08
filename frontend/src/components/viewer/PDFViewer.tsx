@@ -3,6 +3,7 @@ import * as pdfjsLib from 'pdfjs-dist'
 import workerSrc from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { clamp, SCROLL_DEBOUNCE_MS } from '../../hooks/useScrollSync'
 import { VIEWER_SCROLL } from '../../utils/viewerEvents'
+import { PDF_DIM_BATCH as DIM_BATCH, PDF_RENDER_BUFFER as BUFFER } from '../../config'
 import Toast from './Toast'
 import './PDFViewer.css'
 
@@ -11,22 +12,16 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = workerSrc
 
 interface Props {
   filename: string
+  /** Display scale (managed and rendered by the parent — see App.tsx). */
   scale?: number
-  onScaleChange: (s: number) => void
   scrollSyncEnabled?: boolean
   onToggleScrollSync?: () => void
 }
 
-// Pages to pre-render above and below the visible viewport.
-const BUFFER = 2
 // Height of the padding-bottom on .pdf-page (keeps the page-number label visible).
 const PAGE_PADDING_BOTTOM = 40
 // Flex gap between .pdf-page items (matches .pdf-container gap: 20px) plus margin-bottom: 3px.
 const PAGE_GAP = 23
-// Number of pages fetched in parallel when computing dimensions.
-// Avoids flooding the PDF.js worker with all N requests at once while still
-// being much faster than the fully sequential approach.
-const DIM_BATCH = 20
 
 /** Compute the inclusive [start, end] render window for the given scroll state. */
 function computeRenderRange(
@@ -61,7 +56,7 @@ function computeRenderRange(
   ]
 }
 
-function PDFViewer({ filename, scale = 1.0, onScaleChange, scrollSyncEnabled = true, onToggleScrollSync }: Props) {
+function PDFViewer({ filename, scale = 1.0, scrollSyncEnabled = true, onToggleScrollSync }: Props) {
   const [pdf, setPdf] = useState<pdfjsLib.PDFDocumentProxy | null>(null)
   const [numPages, setNumPages] = useState(0)
   const [toast, setToast] = useState<string | null>(null)
@@ -314,15 +309,12 @@ function PDFViewer({ filename, scale = 1.0, onScaleChange, scrollSyncEnabled = t
     <div className="pdf-viewer">
       {toast && <Toast message={toast} onClose={() => setToast(null)} />}
 
-      <div className="pdf-controls">
-        <div className="pdf-zoom">
-          <button onClick={() => onScaleChange(Math.max(0.5, scale - 0.1))} disabled={scale <= 0.5}>−</button>
-          <span>{(scale * 100).toFixed(0)}%</span>
-          <button onClick={() => onScaleChange(Math.min(3, scale + 0.1))} disabled={scale >= 3}>+</button>
-        </div>
-
-        <div className="pdf-controls-right">
-          {onToggleScrollSync && (
+      {/* Zoom is hosted in the panel header (see App.tsx) for layout
+          consistency with the Markdown viewer.  Only the scroll-sync
+          toggle stays here, since it's PDF-specific. */}
+      {onToggleScrollSync && (
+        <div className="pdf-controls">
+          <div className="pdf-controls-right">
             <button
               className={`pdf-sync-btn${scrollSyncEnabled ? ' active' : ''}`}
               onClick={onToggleScrollSync}
@@ -334,9 +326,9 @@ function PDFViewer({ filename, scale = 1.0, onScaleChange, scrollSyncEnabled = t
                 {scrollSyncEnabled ? 'ON' : 'OFF'}
               </span>
             </button>
-          )}
+          </div>
         </div>
-      </div>
+      )}
 
       <div className="pdf-container" ref={containerRef} onScroll={handleScroll}>
         {Array.from({ length: numPages }, (_, i) => {

@@ -15,7 +15,7 @@ from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-from backend.models.schemas import ChunkRequest, ChunkResponse, SaveChunksRequest, ChunkerLibrary
+from backend.models.schemas import ChunkRequest, ChunkResponse, ChunkerLibrary
 from backend.chunkers import ChonkieChunker, DoclingChunker, LangChainChunker, TextChunker
 
 # Registry mapping enum values to chunker classes.
@@ -128,13 +128,21 @@ def chunk_file_in_process(filename: str, settings_dict: dict) -> dict:
 
     from pathlib import Path
     from backend.config import get_settings
-    from backend.services.chunk_storage_service import ChunkStorageService
+    from backend.services.document_service import find_markdown_for_document
+
+    # md_filename is a transport-only field (it tells the worker which MD
+    # variant to read); strip it before forwarding the rest into ChunkRequest.
+    chunk_settings = {k: v for k, v in settings_dict.items() if k != "md_filename"}
+    md_filename = settings_dict.get("md_filename")
 
     s = get_settings()
-    stem = Path(filename).stem
-    md_path = Path(s.MDS_DIR) / f"{stem}.md"
+    md_path = find_markdown_for_document(
+        filename,
+        Path(s.MDS_DIR),
+        md_filename=md_filename,
+    )
 
-    if not md_path.exists():
+    if md_path is None:
         return {"success": False, "error": f"Markdown file not found for '{filename}'"}
 
     try:
@@ -143,25 +151,20 @@ def chunk_file_in_process(filename: str, settings_dict: dict) -> dict:
         return {"success": False, "error": f"Failed to read markdown: {exc}"}
 
     try:
-        request = ChunkRequest(content=content, **settings_dict)
+        request = ChunkRequest(content=content, **chunk_settings)
         result = _worker_chunker.chunk_text(request)
     except Exception as exc:
         return {"success": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
 
-    try:
-        ChunkStorageService().save_chunks(SaveChunksRequest(
-            filename=filename,
-            chunks=[c.model_dump() for c in result.chunks],
-            chunker_type=result.chunker_type,
-            chunker_library=result.chunker_library,
-        ))
-    except Exception as exc:
-        logger.warning("Failed to save chunks for '%s': %s", filename, exc)
-
+    # Chunk persistence is intentionally NOT triggered here.  Saving must be
+    # an explicit, user-driven action via POST /api/chunks/save so that
+    # opening a document or switching the chunk view does not pollute the
+    # ``chunks/`` directory with files the user never asked for.
     return {
         "success": True,
         "total_chunks": result.total_chunks,
         "chunker_type": result.chunker_type,
         "chunker_library": result.chunker_library,
+        "md_filename": md_path.name,
         "chunks": [c.model_dump() for c in result.chunks],
     }

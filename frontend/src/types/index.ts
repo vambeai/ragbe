@@ -75,6 +75,29 @@ export interface ChunkSettings {
 }
 
 // ---------------------------------------------------------------------------
+// Versioned markdowns / chunks — shape returned by:
+//   GET /api/documents/{name}/markdowns
+//   GET /api/documents/{name}/chunks
+// ---------------------------------------------------------------------------
+export interface MarkdownVersion {
+  filename: string
+  source: 'converted' | 'uploaded'
+  converter: string | null
+  file_path: string
+}
+
+export interface ChunksVersion {
+  filename: string
+  md_filename: string | null
+  md_source: string | null
+  library: string
+  algorithm: string
+  chunk_size: number | null
+  chunk_overlap: number | null
+  file_path: string
+}
+
+// ---------------------------------------------------------------------------
 // Capabilities — shape returned by GET /api/capabilities
 // ---------------------------------------------------------------------------
 export interface CapabilityStrategy {

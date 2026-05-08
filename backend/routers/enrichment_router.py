@@ -77,7 +77,9 @@ async def enrich_markdown(http_request: Request, body: EnrichMarkdownRequest):
             temperature=s.temperature, user_prompt=s.user_prompt, http_client=http_client,
         )
 
-        watchdog_s = get_settings().SSE_WATCHDOG_TIMEOUT_S
+        _settings = get_settings()
+        watchdog_s = _settings.SSE_WATCHDOG_TIMEOUT_S
+        queue_timeout_s = _settings.SSE_QUEUE_GET_TIMEOUT_S
         queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
         async def run_enrich() -> None:
@@ -109,7 +111,7 @@ async def enrich_markdown(http_request: Request, body: EnrichMarkdownRequest):
                     return
 
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    event = await asyncio.wait_for(queue.get(), timeout=queue_timeout_s)
                 except asyncio.TimeoutError:
                     last_heartbeat, do_heartbeat, watchdog_fired = sse_timeout_tick(
                         last_event, last_heartbeat, watchdog_s
@@ -193,7 +195,9 @@ async def enrich_chunks(http_request: Request, body: EnrichChunksRequest):
             yield _sse({"type": "done", "operation": "enrich_chunks", "total_chunks": 0, "succeeded": 0})
             return
 
-        watchdog_s = get_settings().SSE_WATCHDOG_TIMEOUT_S
+        _settings = get_settings()
+        watchdog_s = _settings.SSE_WATCHDOG_TIMEOUT_S
+        queue_timeout_s = _settings.SSE_QUEUE_GET_TIMEOUT_S
         # Use the global semaphore from app.state so the cap is enforced across
         # ALL concurrent /enrich/chunks requests, not just within this one call.
         semaphore = http_request.app.state.enrichment_chunks_semaphore
@@ -256,7 +260,7 @@ async def enrich_chunks(http_request: Request, body: EnrichChunksRequest):
                     return
 
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    event = await asyncio.wait_for(queue.get(), timeout=queue_timeout_s)
                 except asyncio.TimeoutError:
                     last_heartbeat, do_heartbeat, watchdog_fired = sse_timeout_tick(
                         last_event, last_heartbeat, watchdog_s

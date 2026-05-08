@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # ── Storage ────────────────────────────────────────────────
     PDFS_DIR: str = "docs/pdfs"
     MDS_DIR: str = "docs/mds"
-    CHUNKS_DIR: str = "chunks"
+    CHUNKS_DIR: str = "docs/chunks"
 
     # ── Logging ────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
@@ -139,6 +139,40 @@ class Settings(BaseSettings):
     SSE_HEARTBEAT_INTERVAL_S: float = 30.0
     """Seconds between SSE heartbeat comments (': heartbeat') sent to keep the
     connection alive through proxies and load balancers."""
+
+    SSE_QUEUE_GET_TIMEOUT_S: float = 0.5
+    """Polling interval for the SSE queue.get() loop. Lower values shorten the
+    delay before disconnects/heartbeats are detected; higher values reduce
+    wake-ups when the stream is idle."""
+
+    SSE_CANCEL_WAIT_TIMEOUT_S: float = 10.0
+    """Seconds to wait for the SSE runner task to finish after cancellation
+    before giving up and continuing shutdown."""
+
+    # ── Worker lifecycle ──────────────────────────────
+    WORKER_SIGKILL_DELAY_S: float = 3.0
+    """Seconds to wait after SIGTERM before escalating to SIGKILL on a worker
+    process that ignores graceful termination."""
+
+    EXECUTOR_SHUTDOWN_TIMEOUT_S: float = 30.0
+    """Seconds allowed for ProcessPoolExecutor.shutdown() at app exit before
+    the executor is force-cancelled."""
+
+    # ── Upload ────────────────────────────────────────
+    UPLOAD_READ_CHUNK_BYTES: int = 65_536
+    """Buffer size used while streaming an upload to disk."""
+
+    PDF_MAGIC_PROBE_BYTES: int = 512
+    """Number of leading bytes inspected to validate the PDF magic signature."""
+
+    # ── Chunking defaults ─────────────────────────────
+    DEFAULT_CHUNK_SIZE: int = 512
+    """Default ``chunk_size`` advertised by the chunking API when the client
+    omits the field."""
+
+    DEFAULT_CHUNK_OVERLAP: int = 51
+    """Default ``chunk_overlap`` advertised by the chunking API when the client
+    omits the field."""
 
     # ── App ────────────────────────────────────────────────────
     APP_VERSION: str = "0.3.0"

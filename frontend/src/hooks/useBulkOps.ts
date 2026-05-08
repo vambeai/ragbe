@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback } from 'react'
-import type { ChunkSettings, ConverterType, VLMSettings, CloudSettings } from '../types'
+import type { ChunkSettings, ConverterType, VLMSettings, CloudSettings, Chunk } from '../types'
 import type { BulkProgressFn, BulkResultFn } from './useDocument'
-import { consumeChunkSse } from '../utils/consumeChunkSse'
+import { chunkSse, saveChunks as saveChunksApi } from '../services/chunksApi'
 import { CONNECTION_LOST_MSG } from '../utils/parseSse'
 
 export interface BulkOp {
@@ -122,6 +122,7 @@ export function useBulkOps({
 
     let succeeded = 0
     let failed = 0
+    let saveFailed = 0
 
     const onFileStart = (filename: string, index: number, total: number) => {
       onProgress(index, total, filename)
@@ -131,14 +132,34 @@ export function useBulkOps({
       )
     }
 
-    const onFileDone = (filename: string, success: boolean) => {
+    // The backend no longer auto-saves chunks during /api/chunk; save must be
+    // triggered explicitly by the caller for each successfully chunked file.
+    // Bulk chunking from the sidebar IS the explicit "bulk export" pathway,
+    // so we save every successful file as it completes.  The backend echoes
+    // back the md_filename it actually chunked, so we forward it to keep
+    // chunks generated from different MD variants distinguishable on disk.
+    //
+    // A save failure must NOT abort the rest of the batch, but it also must
+    // not be silently swallowed: counted separately so the user sees a clear
+    // "chunked but not saved" toast at the end (otherwise the success toast
+    // misleads them into thinking every file made it to disk).
+    const onFileDone = async (filename: string, success: boolean, chunks: Chunk[], mdFilename: string | null) => {
       onResult(filename, success)
-      if (success) succeeded++
-      else failed++
+      if (success) {
+        succeeded++
+        try {
+          await saveChunksApi({ filename, mdFilename, settings, chunks })
+        } catch (err) {
+          saveFailed++
+          console.warn(`Failed to save chunks for '${filename}':`, err)
+        }
+      } else {
+        failed++
+      }
     }
 
     try {
-      await consumeChunkSse(
+      await chunkSse(
         filenames,
         settings,
         signal,
@@ -154,8 +175,10 @@ export function useBulkOps({
 
     setBulkOp(null)
     setBulkConnectionLost(false)
-    if (succeeded > 0) showToast(`Chunked ${succeeded} file${succeeded > 1 ? 's' : ''} ✓`, 'success')
+    const persisted = succeeded - saveFailed
+    if (persisted > 0) showToast(`Chunked ${persisted} file${persisted > 1 ? 's' : ''} ✓`, 'success')
     if (failed > 0) showToast(`${failed} file${failed > 1 ? 's' : ''} failed to chunk`, 'error')
+    if (saveFailed > 0) showToast(`${saveFailed} file${saveFailed > 1 ? 's' : ''} chunked but not saved`, 'error')
   }, [settings, showToast])
 
   return { bulkOp, bulkConnectionLost, interruptBulk, handleBulkConvert, handleBulkChunk }

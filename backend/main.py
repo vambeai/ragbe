@@ -84,9 +84,10 @@ async def lifespan(app: FastAPI):
 
     await app.state.http_client_async.aclose()
     # Shut down process pools in a thread so the event loop stays responsive.
-    # A 30 s timeout ensures the server can always exit even if a worker is stuck
-    # (e.g. inside a C extension ignoring SIGTERM).
+    # The configured timeout ensures the server can always exit even if a
+    # worker is stuck (e.g. inside a C extension ignoring SIGTERM).
     import logging as _log
+    _shutdown_timeout = get_settings().EXECUTOR_SHUTDOWN_TIMEOUT_S
     for _exec_attr, _exec_label in (
         ("cpu_converter_executor", "CPU converter"),
         ("cpu_chunker_executor", "CPU chunker"),
@@ -97,11 +98,13 @@ async def lifespan(app: FastAPI):
         try:
             await asyncio.wait_for(
                 asyncio.to_thread(_executor.shutdown, wait=True),
-                timeout=30.0,
+                timeout=_shutdown_timeout,
             )
         except asyncio.TimeoutError:
             _log.getLogger(__name__).warning(
-                "%s executor did not shut down within 30 s — forcing cancel", _exec_label
+                "%s executor did not shut down within %.0f s — forcing cancel",
+                _exec_label,
+                _shutdown_timeout,
             )
             _executor.shutdown(wait=False, cancel_futures=True)
     _retired_log = _log.getLogger(__name__)

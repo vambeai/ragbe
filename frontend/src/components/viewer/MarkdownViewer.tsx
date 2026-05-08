@@ -5,18 +5,27 @@ import type { EnrichmentSettings } from '../../types'
 import { useMarkdownEnrichment } from '../../hooks/useMarkdownEnrichment'
 import { useScrollSync } from '../../hooks/useScrollSync'
 import { VIEWER_PAGE_SYNC } from '../../utils/viewerEvents'
+import { LAZY_OBSERVER_MARGIN, LAZY_SECTION_TARGET_CHARS } from '../../config'
 import ProgressModal from '../modals/ProgressModal'
 import './MarkdownViewer.css'
 
 interface Props {
   content: string
+  /** Display scale (managed and rendered by the parent — see App.tsx). */
   scale?: number
-  onScaleChange: (s: number) => void
+  /** Padding around the rendered Markdown (managed by the parent). */
   padding?: number
-  onPaddingChange: (p: number) => void
   scrollSyncEnabled?: boolean
   onSaveMarkdown: (content: string) => Promise<void>
   onDeleteMarkdown: () => void
+  /** Triggers PDF→Markdown conversion with the converter currently selected
+   *  in Settings.  The backend short-circuits when the resulting file
+   *  already exists, so re-clicking with the same converter is harmless. */
+  onConvert: () => void
+  /** User-facing label for the active converter (shown on the Convert
+   *  button so the user knows which method will run). */
+  converterLabel: string
+  converting: boolean
   savingMd: boolean
   sectionEnrichment?: EnrichmentSettings
   onEnrichSuccess?: (msg: string) => void
@@ -46,7 +55,7 @@ function splitAtPageMarkers(md: string): Array<{ page: number; content: string }
 // Split markdown at blank-line boundaries into groups of ~targetSize chars.
 // Splitting at \n\n guarantees we never cut inside a block element (table row,
 // code fence, list item) so each section is always valid standalone markdown.
-function splitIntoLazySections(md: string, targetSize = 2500): string[] {
+function splitIntoLazySections(md: string, targetSize = LAZY_SECTION_TARGET_CHARS): string[] {
   const blocks = md.split(/\n\n+/)
   const sections: string[] = []
   let current = ''
@@ -82,7 +91,7 @@ const LazySection = memo(function LazySection({
       ([entry]) => {
         if (entry.isIntersecting) { setVisible(true); observer.disconnect() }
       },
-      { rootMargin: '300px' },
+      { rootMargin: LAZY_OBSERVER_MARGIN },
     )
     observer.observe(el)
     return () => observer.disconnect()
@@ -95,9 +104,10 @@ const LazySection = memo(function LazySection({
 // ── Component ──────────────────────────────────────────────────────────────
 
 function MarkdownViewer({
-  content, scale = 1.0, onScaleChange, padding = 20, onPaddingChange,
+  content, scale = 1.0, padding = 20,
   scrollSyncEnabled = true,
   onSaveMarkdown, onDeleteMarkdown,
+  onConvert, converterLabel, converting,
   savingMd,
   sectionEnrichment,
   onEnrichSuccess, onEnrichError,
@@ -105,7 +115,7 @@ function MarkdownViewer({
   const [editMode, setEditMode] = useState(false)
   const [editContent, setEditContent] = useState(content)
   const [enrichError, setEnrichError] = useState<string | null>(null)
-  const [showReconvertConfirm, setShowReconvertConfirm] = useState(false)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
   const {
     mdEnrichOp,
@@ -216,11 +226,6 @@ function MarkdownViewer({
     return () => { if (restoreRafRef.current !== undefined) cancelAnimationFrame(restoreRafRef.current) }
   }, [editMode])
 
-  // Cancel any in-flight RAF on unmount, regardless of editMode state.
-  useEffect(() => {
-    return () => { if (restoreRafRef.current !== undefined) cancelAnimationFrame(restoreRafRef.current) }
-  }, [])
-
   const handleSaveMd = async () => {
     const ta = textareaRef.current
     if (ta) {
@@ -244,8 +249,8 @@ function MarkdownViewer({
     setEnrichError(null)
   }
 
-  const handleReconvert = () => {
-    setShowReconvertConfirm(false)
+  const handleConfirmDelete = () => {
+    setShowDeleteConfirm(false)
     onDeleteMarkdown()
   }
 
@@ -325,41 +330,37 @@ function MarkdownViewer({
         </div>
       )}
 
-      {/* Reconvert confirmation dialog */}
-      {showReconvertConfirm && (
-        <div className="reconvert-confirm-overlay" onClick={() => setShowReconvertConfirm(false)}>
+      {/* Delete confirmation dialog */}
+      {showDeleteConfirm && (
+        <div className="reconvert-confirm-overlay" onClick={() => setShowDeleteConfirm(false)}>
           <div className="reconvert-confirm" onClick={e => e.stopPropagation()}>
-            <p>This will delete the current Markdown so you can reconvert it. Continue?</p>
+            <p>Delete the currently displayed Markdown variant? Other variants of this document stay intact.</p>
             <div className="reconvert-confirm-actions">
-              <button className="btn-secondary" onClick={() => setShowReconvertConfirm(false)}>Cancel</button>
-              <button className="btn-danger" onClick={handleReconvert}>Delete &amp; Reconvert</button>
+              <button className="btn-secondary" onClick={() => setShowDeleteConfirm(false)}>Cancel</button>
+              <button className="btn-danger" onClick={handleConfirmDelete}>Delete</button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Primary controls bar */}
+      {/* Primary controls bar — actions only.  Zoom + padding live in the
+          panel header (see App.tsx) so this row never overflows. */}
       <div className="md-controls">
-        <div className="md-controls-left">
-          <div className="md-zoom">
-            <button onClick={() => onScaleChange(Math.max(0.5, scale - 0.1))} disabled={scale <= 0.5}>−</button>
-            <span>{(scale * 100).toFixed(0)}%</span>
-            <button onClick={() => onScaleChange(Math.min(3, scale + 0.1))} disabled={scale >= 3}>+</button>
-          </div>
-
-          <div className="padding-control">
-            <label>Padding: {padding}px</label>
-            <input type="range" min={0} max={100} value={padding} onChange={e => onPaddingChange(+e.target.value)} />
-          </div>
-        </div>
-
         <div className="md-controls-right">
           <button
-            className="md-action-btn reconvert"
-            onClick={() => setShowReconvertConfirm(true)}
-            title="Delete Markdown and reconvert"
+            className="md-action-btn convert-now"
+            onClick={onConvert}
+            disabled={converting}
+            title={`Convert this PDF with ${converterLabel}`}
           >
-            <span>🔄</span> Reconvert
+            <span>✨</span> Convert with {converterLabel}
+          </button>
+          <button
+            className="md-action-btn delete-md"
+            onClick={() => setShowDeleteConfirm(true)}
+            title="Delete this Markdown variant"
+          >
+            <span>🗑</span> Delete
           </button>
 
           <div className="md-edit-actions">

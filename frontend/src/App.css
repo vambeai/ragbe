@@ -91,6 +91,7 @@
 }
 
 .viewer-panel {
+  position: relative;    /* anchor for absolutely-positioned overlays */
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -155,6 +156,157 @@
   color: white;
   -webkit-text-fill-color: white;
   box-shadow: 0 2px 8px rgba(139, 69, 19, 0.3);
+}
+
+/* Group the right-aligned panel-label controls (version select, zoom,
+   options) under one parent so margin-left: auto only fires once. */
+.panel-label-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
+/* Compact zoom widget that mirrors panel-view-tab styling — same border,
+   text colour, and font weight so it lives in the panel header without
+   visual noise.  Keeps zoom out of the action toolbar regardless of how
+   many action buttons the viewer is showing. */
+.panel-zoom {
+  display: inline-flex;
+  align-items: center;
+  border: 1.5px solid rgba(139, 69, 19, 0.25);
+  border-radius: 6px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.panel-zoom button {
+  padding: 4px 9px;
+  background: transparent;
+  border: none;
+  color: #8B4513;
+  -webkit-text-fill-color: #8B4513;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s;
+}
+
+.panel-zoom button:hover:not(:disabled) {
+  background: rgba(139, 69, 19, 0.08);
+}
+
+.panel-zoom button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.panel-zoom span {
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #8B4513;
+  letter-spacing: 0.4px;
+  min-width: 38px;
+  text-align: center;
+}
+
+/* Gear button in panel-label that opens the per-viewer view-options popover.
+   Visually identical to panel-view-tab. */
+.panel-options-btn {
+  padding: 4px 10px;
+  background: transparent;
+  border: 1.5px solid rgba(139, 69, 19, 0.25);
+  border-radius: 6px;
+  color: #8B4513;
+  -webkit-text-fill-color: #8B4513;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  flex-shrink: 0;
+}
+
+.panel-options-btn:hover {
+  background: rgba(139, 69, 19, 0.08);
+  border-color: rgba(139, 69, 19, 0.45);
+}
+
+.panel-options-popover {
+  position: absolute;
+  top: 52px;
+  right: 16px;
+  z-index: 50;
+  background: #FFF8EB;
+  border: 2px solid #F0E6D6;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(139, 69, 19, 0.18);
+  padding: 14px 16px;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 12px;
+  color: #5C2E0A;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.panel-options-popover label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.panel-options-popover input[type="range"] {
+  width: 100%;
+  accent-color: #8B4513;
+}
+
+/* Markdown / Chunks version pickers in the panel header — visually
+   indistinguishable from a panel-view-tab so the row reads as one toolbar. */
+.panel-version-select {
+  /* margin-left: auto handled by .panel-label-tools wrapper now */
+  flex-shrink: 1;
+  min-width: 0;
+  padding: 4px 28px 4px 12px;
+  background: transparent;
+  border: 1.5px solid rgba(139, 69, 19, 0.25);
+  border-radius: 6px;
+  color: #8B4513;
+  -webkit-text-fill-color: #8B4513;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  font-family: inherit;
+  flex-shrink: 0;
+  max-width: 240px;
+  text-overflow: ellipsis;
+  /* Custom caret so the native arrow doesn't break the visual rhythm */
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none'><path d='M1 1.5L6 6.5L11 1.5' stroke='%238B4513' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+  background-size: 10px 7px;
+}
+
+.panel-version-select:hover {
+  background-color: rgba(139, 69, 19, 0.08);
+  border-color: rgba(139, 69, 19, 0.45);
+}
+
+.panel-version-select:focus {
+  outline: none;
+  border-color: #8B4513;
 }
 
 /* "PDF →" restore button shown in the Markdown panel-label when PDF is hidden */

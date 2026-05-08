@@ -72,3 +72,19 @@ def safe_stem(filename: str) -> str:
     if not stem or stem in (".", ".."):
         raise HTTPException(status_code=400, detail=f"Invalid filename '{filename}'.")
     return stem
+
+
+def safe_child_path(base: Path, name: str, *, description: str = "filename") -> Path:
+    """Resolve *name* against *base* and refuse anything that escapes *base*.
+
+    Combines the structural check (no slashes, no ``.`` / ``..``) with the
+    runtime check (``parent == base``) so every endpoint that loads a file
+    by user-supplied name shares one guarantee.  The returned path is NOT
+    required to exist; callers handle 404 themselves.
+    """
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail=f"Invalid {description} '{name}'.")
+    candidate = base / name
+    if candidate.parent != base:
+        raise HTTPException(status_code=400, detail=f"Invalid {description} '{name}'.")
+    return candidate

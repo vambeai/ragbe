@@ -5,6 +5,56 @@ import { DEFAULT_ENRICHMENT_BASE_URL, DEFAULT_ENRICHMENT_TEMPERATURE } from '../
 export const API_BASE = '/api'
 
 /**
+ * Map a wire-level converter name (the value used by the /api/convert
+ * endpoint) to the lowercase token the backend uses for filenames and
+ * dropdown identifiers.  Kept in sync with
+ * ``backend.services.document_service._CONVERTER_NORMALIZATION``; only the
+ * identity-different entries need to appear here.
+ */
+const CONVERTER_FILENAME_TOKEN: Record<string, string> = {
+  pymupdf: 'pymupdf4llm',
+}
+
+export function converterFilenameToken(converter: string | undefined | null): string | null {
+  if (!converter) return null
+  return CONVERTER_FILENAME_TOKEN[converter] ?? converter
+}
+
+/**
+ * Set of MD-source tokens that the conversion pipeline produces.  Mirrors
+ * ``backend.utils.naming.KNOWN_MD_SOURCES`` minus ``"uploaded"``: that one
+ * is the fallback, not a token that ever appears as the suffix in a
+ * converted filename.
+ */
+const KNOWN_CONVERTER_TOKENS = new Set([
+  'pymupdf4llm', 'docling', 'markitdown', 'liteparse', 'vlm', 'cloud',
+])
+
+/**
+ * Derive the MD-source token (e.g. ``"docling"``, ``"uploaded"``) from a
+ * Markdown filename without depending on ``availableMarkdowns`` being
+ * populated.  Used by the chunks auto-link logic so the source is known
+ * the moment ``documentData.md_filename`` updates, not only after the
+ * version listing has loaded.
+ */
+export function mdSourceFromFilename(
+  mdFilename: string | null | undefined,
+  pdfFilename: string | null | undefined,
+): string | null {
+  if (!mdFilename) return null
+  const mdStem = mdFilename.replace(/\.md$/i, '')
+  const docStem = (pdfFilename ?? '').replace(/\.pdf$/i, '')
+  if (docStem) {
+    const prefix = `${docStem}_`
+    if (mdStem.startsWith(prefix)) {
+      const token = mdStem.slice(prefix.length)
+      if (KNOWN_CONVERTER_TOKENS.has(token)) return token
+    }
+  }
+  return 'uploaded'
+}
+
+/**
  * Build the request body for enrichment endpoints.
  * Applies defaults for optional fields so callers don't need to repeat them.
  */

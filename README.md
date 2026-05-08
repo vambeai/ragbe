@@ -8,7 +8,7 @@
 <p align="center">
 <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
 <img src="https://img.shields.io/badge/Node.js-22+-339933?style=for-the-badge&logo=node.js&logoColor=white"/>
-<img src="https://img.shields.io/badge/FastAPI-0.135+-009688?style=for-the-badge&logo=fastapi&logoColor=white"/>
+<img src="https://img.shields.io/badge/FastAPI-0.136+-009688?style=for-the-badge&logo=fastapi&logoColor=white"/>
 <img src="https://img.shields.io/badge/React-18+-61DAFB?style=for-the-badge&logo=react&logoColor=white"/>
 <img src="https://img.shields.io/badge/License-MIT-D2691E?style=for-the-badge"/>
 </p>
@@ -50,7 +50,7 @@ As [NVIDIA's research](https://developer.nvidia.com/blog/finding-the-best-chunki
 | 🧠 **Markdown enrichment** *(beta)* | Clean conversion artifacts before chunking |
 | ✨ **Chunk enrichment** *(beta)* | LLM-generated titles, summaries, keywords, and questions per chunk |
 | 🔌 **Pluggable architecture** | Add a converter or splitter in minutes — zero frontend changes |
-| 💾 **Export** | Timestamped JSON chunks, ready for your vector store |
+| 💾 **Export** | JSON chunks, ready for your vector store |
 
 ---
 
@@ -250,16 +250,3 @@ def _chunk_my_strategy(self, request: ChunkRequest) -> list[ChunkItem]:
 ```
 
 Import the module in `capabilities_router.py` and add the strategy to the chunker's `_DISPATCH` table. The strategy appears in the UI automatically.
-
----
-
-## Storage layout
-
-```
-docs/
-  pdfs/          # uploaded PDF files
-  mds/           # converted / uploaded Markdown files
-chunks/
-  <stem>/        # one directory per document
-    <stem>_<library>-<strategy>_<HH-MM-SS>.json
-```

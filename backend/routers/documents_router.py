@@ -53,6 +53,8 @@ from backend.models.schemas import (
     ConverterType,
     DeleteResponse,
     DocumentInfo,
+    MarkdownContentResponse,
+    MarkdownVersionsResponse,
     MdToPdfResponse,
     MultiUploadResponse,
 )
@@ -106,6 +108,38 @@ async def serve_pdf(filename: str):
     return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
 
 
+# ── Versioned Markdown listing / fetch ────────────────────────────────────────
+
+@router.get(
+    "/documents/{document_name}/markdowns",
+    response_model=MarkdownVersionsResponse,
+)
+async def list_markdown_versions(document_name: str):
+    """Return every available Markdown version for a document.
+
+    Each entry distinguishes between converted variants
+    (``source="converted"``, with the parsed converter token) and uploaded
+    files (``source="uploaded"``, ``converter=null``).  This is the data
+    backing the frontend's Markdown-version dropdown.
+    """
+    versions = await asyncio.to_thread(_svc.list_markdown_versions, document_name)
+    return MarkdownVersionsResponse(document_name=document_name, versions=versions)
+
+
+@router.get(
+    "/documents/{document_name}/markdowns/{identifier}",
+    response_model=MarkdownContentResponse,
+)
+async def get_markdown_version(document_name: str, identifier: str):
+    """Return the full text of one specific Markdown version.
+
+    ``identifier`` may be either a converter name (e.g. ``pymupdf4llm``,
+    ``docling``) or the original filename (for uploaded MDs whose name
+    does not match the converter pattern).
+    """
+    return await asyncio.to_thread(_svc.get_markdown_content, document_name, identifier)
+
+
 # ── Upload ────────────────────────────────────────────────────────────────────
 
 @router.post("/upload", response_model=MultiUploadResponse)
@@ -135,7 +169,10 @@ async def convert_pdfs(
         _stop_events: list[threading.Event] = []
         _stop_events_lock = asyncio.Lock()
 
-        watchdog_s = get_settings().SSE_WATCHDOG_TIMEOUT_S
+        _settings = get_settings()
+        watchdog_s = _settings.SSE_WATCHDOG_TIMEOUT_S
+        queue_timeout_s = _settings.SSE_QUEUE_GET_TIMEOUT_S
+        cancel_wait_s = _settings.SSE_CANCEL_WAIT_TIMEOUT_S
         loop = asyncio.get_running_loop()
         is_cpu_bound = request.converter in _CPU_BOUND_CONVERTERS
 
@@ -283,7 +320,7 @@ async def convert_pdfs(
             # 3. Cancel the asyncio runner task.
             runner.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(runner), timeout=10.0)
+                await asyncio.wait_for(asyncio.shield(runner), timeout=cancel_wait_s)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
@@ -303,7 +340,7 @@ async def convert_pdfs(
                     return
 
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    event = await asyncio.wait_for(queue.get(), timeout=queue_timeout_s)
                 except asyncio.TimeoutError:
                     last_heartbeat, do_heartbeat, watchdog_fired = sse_timeout_tick(
                         last_event, last_heartbeat, watchdog_s

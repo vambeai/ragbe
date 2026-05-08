@@ -166,8 +166,8 @@ class ChunkRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=10_000_000, description="Text content to chunk.")
     chunker_type: ChunkerType = Field(default=ChunkerType.token)
     chunker_library: ChunkerLibrary = Field(default=ChunkerLibrary.langchain)
-    chunk_size: int = Field(default=512, gt=0)
-    chunk_overlap: int = Field(default=51, ge=0)
+    chunk_size: int = Field(default_factory=lambda: _get_settings().DEFAULT_CHUNK_SIZE, gt=0)
+    chunk_overlap: int = Field(default_factory=lambda: _get_settings().DEFAULT_CHUNK_OVERLAP, ge=0)
     enable_markdown_sizing: bool = Field(default=False)
 
     @field_validator("chunk_overlap")
@@ -183,6 +183,14 @@ class ChunkFilesRequest(BaseModel):
     """Body for POST /api/chunk — one or more documents to chunk from disk."""
 
     filenames: list[str] = Field(..., min_length=1, description="Document filename(s) to chunk.")
+    md_filename: str | None = Field(
+        default=None,
+        description=(
+            "Specific Markdown variant to chunk (e.g. 'report_pymupdf4llm.md'). "
+            "When omitted, the first available variant is used.  Only meaningful "
+            "for single-document requests; ignored when multiple filenames are sent."
+        ),
+    )
     chunker_type: ChunkerType = Field(
         default=ChunkerType.token,
         description="Splitting strategy.",
@@ -191,8 +199,8 @@ class ChunkFilesRequest(BaseModel):
         default=ChunkerLibrary.langchain,
         description="Underlying splitting library to use.",
     )
-    chunk_size: int = Field(default=512, gt=0, description="Maximum chunk size.")
-    chunk_overlap: int = Field(default=51, ge=0, description="Overlap between chunks.")
+    chunk_size: int = Field(default_factory=lambda: _get_settings().DEFAULT_CHUNK_SIZE, gt=0, description="Maximum chunk size.")
+    chunk_overlap: int = Field(default_factory=lambda: _get_settings().DEFAULT_CHUNK_OVERLAP, ge=0, description="Overlap between chunks.")
     enable_markdown_sizing: bool = Field(
         default=False,
         description=(
@@ -243,9 +251,19 @@ class ChunkResponse(BaseModel):
 
 class SaveChunksRequest(BaseModel):
     filename: str = Field(..., min_length=1)
+    md_filename: str | None = Field(
+        default=None,
+        description="The Markdown filename the chunks were generated from "
+                    "(e.g. 'report_pymupdf4llm.md').  Encoded into the saved "
+                    "chunk filename so chunks from different MD variants "
+                    "stay distinguishable.",
+    )
     chunks: list[dict[str, Any]]
     chunker_type: str | None = Field(default=None)
     chunker_library: str | None = Field(default=None)
+    chunk_size: int | None = Field(default=None)
+    chunk_overlap: int | None = Field(default=None)
+    enable_markdown_sizing: bool = Field(default=False)
 
 
 class SaveChunksResponse(BaseModel):
@@ -258,6 +276,80 @@ class LoadChunksResponse(BaseModel):
     chunks: list[dict[str, Any]]
     total_chunks: int
     filename: str
+
+
+# ---------------------------------------------------------------------------
+# Versioned markdowns / chunks endpoints
+# ---------------------------------------------------------------------------
+
+
+class MarkdownVersion(BaseModel):
+    """A single available Markdown version for a document.
+
+    ``source`` distinguishes between Markdown produced by an internal
+    PDF→MD conversion (``"converted"``) and Markdown the user uploaded
+    directly (``"uploaded"``).  ``converter`` is populated only when
+    ``source == "converted"``.
+    """
+
+    filename: str
+    source: str = Field(..., description='Either "converted" or "uploaded".')
+    converter: str | None = Field(
+        default=None,
+        description="Normalised converter name when source is 'converted'.",
+    )
+    file_path: str
+
+
+class MarkdownVersionsResponse(BaseModel):
+    document_name: str
+    versions: list[MarkdownVersion]
+
+
+class MarkdownContentResponse(BaseModel):
+    filename: str
+    source: str
+    converter: str | None = None
+    content: str
+
+
+class ChunksVersion(BaseModel):
+    """A single saved chunks JSON file for a document.
+
+    Each saved file is keyed by its splitting *configuration* — library,
+    algorithm, and (when applicable) chunk size and overlap — so the same
+    configuration always overwrites the same file.  Fields not used by the
+    underlying algorithm (e.g. overlap for Docling) are reported as
+    ``null``.
+    """
+
+    filename: str
+    md_filename: str | None = Field(
+        default=None,
+        description="Source Markdown filename the chunks were generated from, "
+                    "parsed from the chunk filename when available.",
+    )
+    md_source: str | None = Field(
+        default=None,
+        description="Short token identifying the source MD variant "
+                    "(converter name like 'pymupdf4llm', or 'uploaded').",
+    )
+    library: str = Field(..., description="Library name parsed from the filename.")
+    algorithm: str = Field(..., description="Algorithm name parsed from the filename.")
+    chunk_size: int | None = Field(
+        default=None,
+        description="Chunk size encoded in the filename, or null when the algorithm doesn't use it.",
+    )
+    chunk_overlap: int | None = Field(
+        default=None,
+        description="Chunk overlap encoded in the filename, or null when the algorithm doesn't use it.",
+    )
+    file_path: str
+
+
+class ChunksVersionsResponse(BaseModel):
+    document_name: str
+    versions: list[ChunksVersion]
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ import asyncio
 import logging
 import time
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Request
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 from backend.config import get_settings
 from backend.models.schemas import (
     ChunkFilesRequest,
+    ChunksVersionsResponse,
     LoadChunksResponse,
     SaveChunksRequest,
     SaveChunksResponse,
@@ -83,16 +85,56 @@ async def chunk_documents(http_request: Request, request: ChunkFilesRequest):
             "chunk_size": request.chunk_size,
             "chunk_overlap": request.chunk_overlap,
             "enable_markdown_sizing": request.enable_markdown_sizing,
+            # Worker-only transport key — chunking_service strips it before
+            # forwarding to ChunkRequest.  Only meaningful for single-file
+            # requests; harmless when None.
+            "md_filename": request.md_filename if total == 1 else None,
         }
 
-        watchdog_s = get_settings().SSE_WATCHDOG_TIMEOUT_S
-        executor: ProcessPoolExecutor = http_request.app.state.cpu_chunker_executor
+        _settings = get_settings()
+        watchdog_s = _settings.SSE_WATCHDOG_TIMEOUT_S
+        queue_timeout_s = _settings.SSE_QUEUE_GET_TIMEOUT_S
+        cancel_wait_s = _settings.SSE_CANCEL_WAIT_TIMEOUT_S
+        # The executor is now read freshly inside _submit_with_retry below,
+        # so a sibling cancellation that retires the pool doesn't strand us
+        # holding a reference to the dead one.
         semaphore = http_request.app.state.chunk_semaphore
         _cpu_futures: list = []
 
         if await http_request.is_disconnected():
             yield _sse({"type": "cancelled"})
             return
+
+        async def _submit_with_retry(fn: str) -> dict:
+            """Submit a chunk job and tolerate one BrokenProcessPool.
+
+            When the user switches documents quickly, the disconnect on
+            the abandoned request triggers `_cancel_all` which SIGTERMs
+            every worker in the pool — including any worker about to pick
+            up *this* request.  ``cancel_cpu_executor`` swaps the executor
+            on app.state in the same teardown, so a single retry against
+            the fresh pool succeeds.
+            """
+            last_exc: Exception | None = None
+            for attempt in range(2):
+                cur_executor: ProcessPoolExecutor = http_request.app.state.cpu_chunker_executor
+                cf_local = cur_executor.submit(chunk_file_in_process, fn, settings_dict)
+                _cpu_futures.append(cf_local)
+                try:
+                    return await asyncio.wrap_future(cf_local)
+                except BrokenProcessPool as exc:
+                    last_exc = exc
+                    logger.info(
+                        "Chunk worker pool was retired mid-request for '%s' (attempt %d) — retrying on fresh pool",
+                        fn, attempt + 1,
+                    )
+                finally:
+                    try:
+                        _cpu_futures.remove(cf_local)
+                    except ValueError:
+                        pass
+            assert last_exc is not None
+            raise last_exc
 
         async def chunk_one(idx: int, fn: str) -> None:
             nonlocal succeeded, failed
@@ -103,17 +145,9 @@ async def chunk_documents(http_request: Request, request: ChunkFilesRequest):
 
                 queue.put_nowait({"type": "file_start", "filename": fn, "index": idx + 1, "total": total})
 
-                cf = executor.submit(chunk_file_in_process, fn, settings_dict)
-                _cpu_futures.append(cf)
                 _done = 0
                 try:
-                    try:
-                        result = await asyncio.wrap_future(cf)
-                    finally:
-                        try:
-                            _cpu_futures.remove(cf)
-                        except ValueError:
-                            pass
+                    result = await _submit_with_retry(fn)
 
                     async with _lock:
                         if result.get("success"):
@@ -164,7 +198,7 @@ async def chunk_documents(http_request: Request, request: ChunkFilesRequest):
             )
             runner.cancel()
             try:
-                await asyncio.wait_for(asyncio.shield(runner), timeout=10.0)
+                await asyncio.wait_for(asyncio.shield(runner), timeout=cancel_wait_s)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
@@ -180,7 +214,7 @@ async def chunk_documents(http_request: Request, request: ChunkFilesRequest):
                     return
 
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    event = await asyncio.wait_for(queue.get(), timeout=queue_timeout_s)
                 except asyncio.TimeoutError:
                     last_heartbeat, do_heartbeat, watchdog_fired = sse_timeout_tick(
                         last_event, last_heartbeat, watchdog_s
@@ -224,3 +258,30 @@ async def save_chunks(request: SaveChunksRequest):
 async def load_chunks(filename: str):
     """Load the most recently saved chunk set for a document."""
     return await asyncio.to_thread(_storage.load_chunks, filename)
+
+
+@router.get(
+    "/documents/{document_name}/chunks",
+    response_model=ChunksVersionsResponse,
+)
+async def list_chunks_versions(document_name: str):
+    """Return every saved chunks JSON file for a document, newest first.
+
+    Each entry has its ``algorithm`` and ``timestamp`` parsed from the
+    filename so the frontend can render a human-readable picker.  Legacy
+    files that pre-date the new naming scheme appear with
+    ``algorithm = "unknown"``.
+    """
+    versions = await asyncio.to_thread(_storage.list_versions, document_name)
+    return ChunksVersionsResponse(document_name=document_name, versions=versions)
+
+
+@router.get(
+    "/documents/{document_name}/chunks/{chunks_filename}",
+    response_model=LoadChunksResponse,
+)
+async def load_chunks_version(document_name: str, chunks_filename: str):
+    """Load one specific saved-chunks file by filename."""
+    return await asyncio.to_thread(
+        _storage.load_chunks_by_filename, document_name, chunks_filename,
+    )

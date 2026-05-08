@@ -11,6 +11,12 @@ import { useChunks } from './hooks/useChunks'
 import { useBulkOps } from './hooks/useBulkOps'
 import { loadSplitPct, saveSplitPct } from './hooks/useSettings'
 import PDFViewer from './components/viewer/PDFViewer'
+import { converterFilenameToken, mdSourceFromFilename } from './services/apiService'
+import {
+  METADATA_FETCH_TIMEOUT_MS,
+  TOAST_DURATION_ERROR_MS,
+  TOAST_DURATION_SUCCESS_MS,
+} from './config'
 import './App.css'
 
 interface ToastState {
@@ -45,6 +51,9 @@ export default function App() {
     convertMdToPdf, cancelMdToPdfConversion,
     saveMarkdown, deleteMarkdown,
     batchConvert,
+    availableMarkdowns, availableChunks,
+    selectedMarkdown, selectedChunks,
+    selectMarkdownVersion, setSelectedChunks, refreshVersions,
   } = useDocument(toastCallbacks)
 
   // ── UI state ─────────────────────────────────────────────────
@@ -56,16 +65,147 @@ export default function App() {
   // Set of PDF filenames that have a corresponding markdown file.
   const [docsWithMarkdown, setDocsWithMarkdown] = useState<Set<string>>(new Set())
 
+  // The active Markdown source token ("pymupdf4llm", "docling", "uploaded",
+  // …) — used by the saved-chunks filter, the auto-link logic inside
+  // useChunks, and the chunks-dropdown rendering.
+  //
+  // Prefers the entry from ``availableMarkdowns`` (authoritative on
+  // source/converter) but falls back to parsing the filename so the source
+  // is known the moment documentData.md_filename updates — the fetch for
+  // the version list is a separate round-trip and would otherwise leave a
+  // window where currentMdSource is null and the auto-link can't fire.
+  const currentMdSource = useMemo<string | null>(() => {
+    if (!documentData?.md_filename) return null
+    const v = availableMarkdowns.find(m => m.filename === documentData.md_filename)
+    if (v) return v.source === 'converted' && v.converter ? v.converter : 'uploaded'
+    return mdSourceFromFilename(documentData.md_filename, documentData.pdf_filename)
+  }, [documentData?.md_filename, documentData?.pdf_filename, availableMarkdowns])
+
+  // useChunks derives the active Markdown filename from documentData itself —
+  // see the comment in the hook.  We pass it the chunks-version list and
+  // the active MD source so it can auto-link the panel to a saved version
+  // that already matches the current configuration.
   const {
-    chunks, settings, saving: savingChunks, chunking,
+    chunks, settings, saving: savingChunks, chunking, chunksDirty,
     applySettings, editChunk, deleteChunk, deleteChunks, mergeChunks, saveChunks, cancelChunking,
-    enrichChunk,
-  } = useChunks(documentData, selectedDoc, rightView === 'chunks', toastCallbacks)
+    enrichChunk, loadSavedChunks, rechunk,
+  } = useChunks(
+    documentData, selectedDoc, rightView === 'chunks', toastCallbacks,
+    availableChunks, currentMdSource, setSelectedChunks,
+  )
+
+  const handleSaveChunks = useCallback(async () => {
+    const savedFilename = await saveChunks()
+    refreshVersions()
+    // Highlight the file we just wrote in the saved-versions dropdown — the
+    // user expects "I saved this" to translate to "the picker now shows it".
+    if (savedFilename) setSelectedChunks(savedFilename)
+  }, [saveChunks, refreshVersions, setSelectedChunks])
+
+  // ── Unsaved-chunks confirmation flow ────────────────────────────────────────
+  // Any action that would discard the in-memory chunk list (switching docs,
+  // changing chunker settings, loading a different saved version) is funneled
+  // through ``runOrConfirm`` — when ``chunksDirty`` is true, the action is
+  // staged in ``pendingChunkAction`` and the user is asked to Save / Discard /
+  // Cancel before it runs.
+  type PendingAction =
+    | { kind: 'switch'; filename: string }
+    | { kind: 'apply-settings'; settings: typeof settings }
+    | { kind: 'load-saved'; filename: string }
+    | { kind: 'rechunk' }
+    | { kind: 'convert' }
+    | { kind: 'select-md'; identifier: string }
+    | { kind: 'delete-md' }
+  const [pendingChunkAction, setPendingChunkAction] = useState<PendingAction | null>(null)
+
+  const executePendingAction = useCallback((a: PendingAction) => {
+    if (a.kind === 'switch') {
+      selectDocument(a.filename)
+    } else if (a.kind === 'apply-settings') {
+      applySettings(a.settings)
+      // Settings change always triggers a fresh re-chunk in useChunks; clear
+      // the saved-version selection so the picker stops claiming we're still
+      // viewing the previously-loaded version.
+      setSelectedChunks(null)
+    } else if (a.kind === 'load-saved') {
+      setSelectedChunks(a.filename)
+      // Sync the chunker settings to the version being loaded so the next
+      // Save overwrites THIS file.  Saved-chunk filenames are
+      // configuration-keyed (library/algorithm/size/overlap) — without
+      // this sync, edit + save lands at whatever the current settings
+      // dictate, NOT at the file the user is actually viewing.
+      const v = availableChunks.find(c => c.filename === a.filename)
+      if (v) {
+        applySettings({
+          ...settings,
+          chunkerType: v.algorithm,
+          chunkerLibrary: v.library,
+          chunkSize: v.chunk_size ?? settings.chunkSize,
+          chunkOverlap: v.chunk_overlap ?? settings.chunkOverlap,
+          // Saved markdown-strategy files only carry size/overlap when
+          // markdown sizing was enabled — recover that flag here.
+          enableMarkdownSizing: v.algorithm === 'markdown'
+            ? v.chunk_size != null
+            : settings.enableMarkdownSizing,
+        })
+      }
+      loadSavedChunks(a.filename)
+    } else if (a.kind === 'rechunk') {
+      rechunk()
+      setSelectedChunks(null)
+    } else if (a.kind === 'convert') {
+      convertToMarkdown(settings.converter, settings.vlm, settings.cloud)
+    } else if (a.kind === 'select-md') {
+      selectMarkdownVersion(a.identifier)
+    } else if (a.kind === 'delete-md') {
+      deleteMarkdown()
+    }
+  }, [selectDocument, applySettings, loadSavedChunks, rechunk, setSelectedChunks,
+      convertToMarkdown, selectMarkdownVersion, deleteMarkdown,
+      availableChunks, settings])
+
+  const runOrConfirm = useCallback((a: PendingAction) => {
+    if (chunksDirty) setPendingChunkAction(a)
+    else executePendingAction(a)
+  }, [chunksDirty, executePendingAction])
+
+  const handleSaveDirty = useCallback(async () => {
+    const a = pendingChunkAction
+    if (!a) return
+    setPendingChunkAction(null)
+    await handleSaveChunks()
+    executePendingAction(a)
+  }, [pendingChunkAction, handleSaveChunks, executePendingAction])
+
+  const handleDiscardDirty = useCallback(() => {
+    const a = pendingChunkAction
+    if (!a) return
+    setPendingChunkAction(null)
+    executePendingAction(a)
+  }, [pendingChunkAction, executePendingAction])
+
+  const handleCancelDirty = useCallback(() => setPendingChunkAction(null), [])
+
+  const handleLoadSavedChunks = useCallback((filename: string) => {
+    runOrConfirm({ kind: 'load-saved', filename })
+  }, [runOrConfirm])
+
+  const handleApplySettings = useCallback((newSettings: typeof settings) => {
+    runOrConfirm({ kind: 'apply-settings', settings: newSettings })
+  }, [runOrConfirm])
+
+  const handleRechunk = useCallback(() => {
+    runOrConfirm({ kind: 'rechunk' })
+  }, [runOrConfirm])
 
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [pdfScale, setPdfScale] = useState(1.0)
   const [mdScale, setMdScale] = useState(1.0)
   const [mdPadding, setMdPadding] = useState(20)
+  // Tracks which panel ('left' | 'right') currently has the view-options
+  // popover open; null means closed.  Only the MD viewer surfaces this
+  // popover (PDF only needs zoom, which sits inline in the panel header).
+  const [optionsOpenIn, setOptionsOpenIn] = useState<null | 'left' | 'right'>(null)
   const [splitPct, setSplitPct] = useState(() => loadSplitPct())
   const [isDragging, setIsDragging] = useState(false)
   const leftPanelRef = useRef<HTMLDivElement>(null)
@@ -78,6 +218,15 @@ export default function App() {
     if (!documentData) return
     if (!documentData.has_markdown) { setLeftView('pdf'); setRightView('markdown') }
   }, [selectedDoc, documentData?.has_markdown])
+
+  // NOTE: a previous version of this file had a useEffect here that cleared
+  // ``selectedChunks`` whenever ``selectedMarkdown`` changed.  That ran AFTER
+  // useChunks's chunking effect (registration order), so on a doc switch it
+  // overwrote the saved-version selection that the auto-link had just set —
+  // the dropdown ended up showing the placeholder even when a matching
+  // saved file existed.  ``useChunks`` already calls
+  // ``setSelectedChunksFilename(null)`` itself when no match is found, so
+  // this effect was redundant on top of being broken.
 
   const handleSetLeftView = (view: 'pdf' | 'markdown') => {
     if (view === 'markdown' && rightView === 'markdown') setRightView('chunks')
@@ -95,7 +244,7 @@ export default function App() {
   const documentsKey = useMemo(() => documents.join(','), [documents])
   useEffect(() => {
     if (documentsKey === '') { setDocsWithMarkdown(new Set()); return }
-    fetch('/api/documents/metadata', { signal: AbortSignal.timeout(5000) })
+    fetch('/api/documents/metadata', { signal: AbortSignal.timeout(METADATA_FETCH_TIMEOUT_MS) })
       .then(r => r.ok ? r.json() : [])
       .then((meta: Array<{ filename: string; has_markdown: boolean }>) => {
         setDocsWithMarkdown(new Set(meta.filter(m => m.has_markdown).map(m => m.filename)))
@@ -153,9 +302,21 @@ export default function App() {
     }
   }, [isDragging])
 
+  // Funnel every path that could replace or discard the in-memory chunk
+  // list through ``runOrConfirm`` so the unsaved-chunks popup fires
+  // consistently whether the trigger is a settings change, a doc switch,
+  // a Markdown re-conversion, an MD-variant switch, or a delete.
   const handleConvert = useCallback(() => {
-    convertToMarkdown(settings.converter, settings.vlm, settings.cloud)
-  }, [convertToMarkdown, settings.converter, settings.vlm, settings.cloud])
+    runOrConfirm({ kind: 'convert' })
+  }, [runOrConfirm])
+
+  const handleSelectMarkdownVersion = useCallback((identifier: string) => {
+    runOrConfirm({ kind: 'select-md', identifier })
+  }, [runOrConfirm])
+
+  const handleDeleteMarkdown = useCallback(() => {
+    runOrConfirm({ kind: 'delete-md' })
+  }, [runOrConfirm])
 
   const converterLabel = settings.converter ?? 'Convert'
 
@@ -170,9 +331,9 @@ export default function App() {
     if (converting || convertingToPdf || chunking) {
       setPendingDoc(filename)
     } else {
-      selectDocument(filename)
+      runOrConfirm({ kind: 'switch', filename })
     }
-  }, [converting, convertingToPdf, chunking, selectDocument])
+  }, [converting, convertingToPdf, chunking, runOrConfirm])
 
   const confirmSwitch = useCallback(() => {
     if (!pendingDoc) return
@@ -188,13 +349,27 @@ export default function App() {
   // ── Bulk operations ───────────────────────────────────────────
   // Called by useBulkOps after a successful batch convert to refresh metadata
   // and the active document panel.
+  //
+  // After refreshing, we explicitly switch the active document to the variant
+  // produced by the converter that was just run.  Without this step
+  // refreshDocument falls back to /document/{filename}'s default — the
+  // *alphabetically first* converted MD on disk — which means converting a
+  // PDF with method B while method A's MD already exists silently leaves the
+  // viewer (and the chunking that's keyed off documentData.md_filename) on
+  // A's content.
   const handleConvertSuccess = useCallback(async (succeededFiles: Set<string>) => {
-    const meta: Array<{ filename: string; has_markdown: boolean }> = await fetch('/api/documents/metadata', { signal: AbortSignal.timeout(5000) })
+    const meta: Array<{ filename: string; has_markdown: boolean }> = await fetch('/api/documents/metadata', { signal: AbortSignal.timeout(METADATA_FETCH_TIMEOUT_MS) })
       .then(r => r.ok ? r.json() : [])
       .catch(() => [])
     setDocsWithMarkdown(new Set(meta.filter(m => m.has_markdown).map(m => m.filename)))
-    if (selectedDoc && succeededFiles.has(selectedDoc)) await refreshDocument()
-  }, [selectedDoc, refreshDocument])
+    if (selectedDoc && succeededFiles.has(selectedDoc)) {
+      await refreshDocument()
+      const token = converterFilenameToken(settings.converter)
+      if (token) {
+        await selectMarkdownVersion(token)
+      }
+    }
+  }, [selectedDoc, refreshDocument, selectMarkdownVersion, settings.converter])
 
   const {
     bulkOp, bulkConnectionLost, interruptBulk, handleBulkConvert, handleBulkChunk,
@@ -204,6 +379,123 @@ export default function App() {
     showToast,
     onConvertSuccess: handleConvertSuccess,
   })
+
+  // ── Saved-chunk filtering ─────────────────────────────────────────────────
+  // The chunks dropdown must reflect ONLY the saved chunks generated from the
+  // currently displayed Markdown variant — not every chunks file the document
+  // has on disk.  Filter by md_source against the source we already derived
+  // for useChunks above.
+  const chunksForCurrentMd = useMemo(() => {
+    if (currentMdSource === null) return availableChunks
+    // Legacy chunk files that don't encode an md_source are kept visible so
+    // pre-existing data isn't hidden after the upgrade.
+    return availableChunks.filter(c => c.md_source == null || c.md_source === currentMdSource)
+  }, [availableChunks, currentMdSource])
+
+  // ── Panel-header version pickers ─────────────────────────────────────────
+  // Rendered inside the .panel-label row alongside the PDF/Markdown/Chunks
+  // tabs.  Lifted out of MarkdownViewer/ChunkViewer so they always have room
+  // to coexist with the action toolbars and so their styling can match the
+  // tabs (one shared toolbar feel).
+  const renderMarkdownVersionPicker = (): React.ReactNode => {
+    if (!availableMarkdowns || availableMarkdowns.length === 0) return null
+    return (
+      <select
+        className="panel-version-select"
+        value={selectedMarkdown ?? ''}
+        onChange={e => {
+          const v = availableMarkdowns.find(x => x.filename === e.target.value)
+          if (!v) return
+          // Identifier is the converter name when known, otherwise the raw
+          // filename — matches the dual-lookup the backend supports.
+          const id = v.source === 'converted' && v.converter ? v.converter : v.filename
+          handleSelectMarkdownVersion(id)
+        }}
+        title="Switch between Markdown versions for this document"
+      >
+        {availableMarkdowns.map(v => {
+          const label = v.source === 'converted' && v.converter
+            ? v.converter
+            : `${v.filename} · uploaded`
+          return <option key={v.filename} value={v.filename}>{label}</option>
+        })}
+      </select>
+    )
+  }
+
+  /**
+   * Compact zoom widget rendered inside the panel header.  Same scale
+   * state for both PDF and MD viewers, just bound to a different setter
+   * per panel.
+   */
+  const renderZoomControl = (
+    scale: number,
+    setScale: (s: number) => void,
+  ): React.ReactNode => (
+    <div className="panel-zoom" title="Zoom">
+      <button onClick={() => setScale(Math.max(0.5, scale - 0.1))} disabled={scale <= 0.5}>−</button>
+      <span>{(scale * 100).toFixed(0)}%</span>
+      <button onClick={() => setScale(Math.min(3, scale + 0.1))} disabled={scale >= 3}>+</button>
+    </div>
+  )
+
+  /**
+   * View-options popover trigger for the Markdown viewer.  Currently only
+   * exposes the padding slider; PDF doesn't need it so the trigger is
+   * MD-only.
+   */
+  const renderMdOptionsTrigger = (panel: 'left' | 'right'): React.ReactNode => (
+    <button
+      className="panel-options-btn"
+      onClick={() => setOptionsOpenIn(prev => (prev === panel ? null : panel))}
+      title="View options"
+    >⚙</button>
+  )
+
+  const renderMdOptionsPopover = (panel: 'left' | 'right'): React.ReactNode => (
+    optionsOpenIn === panel
+      ? (
+          <div className="panel-options-popover" onClick={e => e.stopPropagation()}>
+            <label>
+              <span>Padding</span>
+              <span>{mdPadding}px</span>
+            </label>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              value={mdPadding}
+              onChange={e => setMdPadding(+e.target.value)}
+            />
+          </div>
+        )
+      : null
+  )
+
+  const renderChunksVersionPicker = (): React.ReactNode => {
+    if (!chunksForCurrentMd || chunksForCurrentMd.length === 0) return null
+    return (
+      <select
+        className="panel-version-select"
+        value={selectedChunks ?? ''}
+        onChange={e => { if (e.target.value) handleLoadSavedChunks(e.target.value) }}
+        title="Load a previously saved chunk version"
+      >
+        {!selectedChunks && <option value="" disabled hidden>— select a saved version —</option>}
+        {chunksForCurrentMd.map(v => {
+          const params: string[] = []
+          if (v.chunk_size != null) params.push(`size ${v.chunk_size}`)
+          if (v.chunk_overlap != null) params.push(`overlap ${v.chunk_overlap}`)
+          const suffix = params.length > 0 ? ` (${params.join(', ')})` : ''
+          return (
+            <option key={v.filename} value={v.filename}>
+              {`${v.library}/${v.algorithm}${suffix}`}
+            </option>
+          )
+        })}
+      </select>
+    )
+  }
 
 
   // ── Markdown panel helper — avoids duplicating MarkdownViewer props ──────
@@ -224,12 +516,13 @@ export default function App() {
       <MarkdownViewer
         content={documentData.md_content}
         scale={mdScale}
-        onScaleChange={setMdScale}
         padding={mdPadding}
-        onPaddingChange={setMdPadding}
         scrollSyncEnabled={scrollSync}
         onSaveMarkdown={saveMarkdown}
-        onDeleteMarkdown={deleteMarkdown}
+        onDeleteMarkdown={handleDeleteMarkdown}
+        onConvert={handleConvert}
+        converterLabel={converterLabel}
+        converting={converting}
         savingMd={savingMd}
         sectionEnrichment={settings.sectionEnrichment}
         onEnrichSuccess={toastCallbacks.onSuccess}
@@ -245,7 +538,7 @@ export default function App() {
           key={toast.id}
           message={toast.message}
           type={toast.type}
-          duration={toast.type === 'error' ? 10000 : 4000}
+          duration={toast.type === 'error' ? TOAST_DURATION_ERROR_MS : TOAST_DURATION_SUCCESS_MS}
           onClose={handleToastClose}
         />
       )}
@@ -280,6 +573,24 @@ export default function App() {
             ? 'Connection lost — the operation may have been interrupted. You can safely start a new conversion.'
             : undefined}
         />
+      )}
+
+      {/* ── Unsaved chunks confirmation ── */}
+      {pendingChunkAction && (
+        <div className="confirm-switch-overlay" onClick={handleCancelDirty}>
+          <div className="confirm-switch-dialog" onClick={e => e.stopPropagation()}>
+            <p>
+              You have unsaved chunk changes. Save them before continuing?
+            </p>
+            <div className="confirm-switch-actions">
+              <button className="btn-secondary" onClick={handleCancelDirty}>Cancel</button>
+              <button className="btn-secondary" onClick={handleDiscardDirty}>Discard</button>
+              <button className="btn-primary" onClick={handleSaveDirty} disabled={savingChunks}>
+                {savingChunks ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* ── Confirm switch while processing ── */}
@@ -340,13 +651,19 @@ export default function App() {
                       className={`panel-view-tab${leftView === 'markdown' ? ' active' : ''}`}
                       onClick={() => handleSetLeftView('markdown')}
                     >Markdown</button>
+                    <div className="panel-label-tools">
+                      {leftView === 'markdown' && documentData.has_markdown && renderMarkdownVersionPicker()}
+                      {leftView === 'pdf' && documentData.has_pdf && renderZoomControl(pdfScale, setPdfScale)}
+                      {leftView === 'markdown' && documentData.has_markdown && renderZoomControl(mdScale, setMdScale)}
+                      {leftView === 'markdown' && documentData.has_markdown && renderMdOptionsTrigger('left')}
+                    </div>
                   </div>
+                  {renderMdOptionsPopover('left')}
                   {leftView === 'pdf' ? (
                     documentData.has_pdf ? (
                       <PDFViewer
                         filename={selectedDoc}
                         scale={pdfScale}
-                        onScaleChange={setPdfScale}
                         scrollSyncEnabled={scrollSync}
                         onToggleScrollSync={handleToggleScrollSync}
                       />
@@ -410,7 +727,14 @@ export default function App() {
                         onClick={() => handleSetRightView('chunks')}
                       >Chunks</button>
                     )}
+                    <div className="panel-label-tools">
+                      {rightView === 'markdown' && documentData.has_markdown && renderMarkdownVersionPicker()}
+                      {rightView === 'chunks' && renderChunksVersionPicker()}
+                      {rightView === 'markdown' && documentData.has_markdown && renderZoomControl(mdScale, setMdScale)}
+                      {rightView === 'markdown' && documentData.has_markdown && renderMdOptionsTrigger('right')}
+                    </div>
                   </div>
+                  {renderMdOptionsPopover('right')}
                   {rightView === 'markdown' ? (
                     renderMarkdownPanel()
                   ) : (
@@ -426,7 +750,9 @@ export default function App() {
                       onDeleteChunk={deleteChunk}
                       onDeleteChunks={deleteChunks}
                       onMergeChunks={mergeChunks}
-                      onSaveChunks={saveChunks}
+                      onSaveChunks={handleSaveChunks}
+                      onRechunk={handleRechunk}
+                      chunkerLabel={settings.chunkerType}
                       scrollSyncEnabled={scrollSync}
                       onEnrichSuccess={toastCallbacks.onSuccess}
                       onEnrichError={toastCallbacks.onError}
@@ -441,7 +767,7 @@ export default function App() {
         <SettingsModal
           isOpen={settingsOpen}
           onClose={() => setSettingsOpen(false)}
-          onSave={applySettings}
+          onSave={handleApplySettings}
           current={settings}
         />
       </div>
