@@ -21,6 +21,8 @@
 
 ---
 
+> ⚠️ **v0.4.0:** A clean project directory is required. Remove any existing PDF, Markdown, and chunk files before upgrading to this version.
+
 ## Why Chunky?
 
 Most RAG pipelines fail silently — and when they do, the cause is often bad Markdown, bad chunking, or both. When PDFs are converted, tables collapse, layouts scramble, and artifacts bleed into your text. You never see it. You just get hallucinations downstream. Chunky is a local, open-source tool that gives you full visibility at both stages — validate your Markdown, validate your chunks, fix what's wrong before it reaches your vector store.
