@@ -1,5 +1,5 @@
-chonkie==1.6.4
-docling==2.91.0
+chonkie==1.6.6
+docling==2.93.0
 fastapi==0.136.1
 httpx==0.28.1
 langchain-text-splitters==1.1.2
@@ -7,10 +7,10 @@ liteparse==1.2.1
 markdown-pdf==1.13.1
 markitdown[pdf]==0.1.5
 model2vec==0.8.1
-openai==2.32.0
-pydantic==2.13.3
-pydantic-settings==2.14.0
+openai==2.37.0
+pydantic==2.13.4
+pydantic-settings==2.14.1
 pymupdf4llm==1.27.2.3
-python-multipart==0.0.26
-tiktoken==0.12.0
-uvicorn==0.46.0
+python-multipart==0.0.28
+tiktoken==0.13.0
+uvicorn==0.47.0

@@ -21,8 +21,6 @@
 
 ---
 
-> ⚠️ **v0.4.0:** A clean project directory is required. Remove any existing PDF, Markdown, and chunk files before upgrading to this version.
-
 ## Why Chunky?
 
 Most RAG pipelines fail silently — and when they do, the cause is often bad Markdown, bad chunking, or both. When PDFs are converted, tables collapse, layouts scramble, and artifacts bleed into your text. You never see it. You just get hallucinations downstream. Chunky is a local, open-source tool that gives you full visibility at both stages — validate your Markdown, validate your chunks, fix what's wrong before it reaches your vector store.
@@ -32,8 +30,6 @@ As [NVIDIA's research](https://developer.nvidia.com/blog/finding-the-best-chunki
 <p align="center">
   <img src="assets/pipeline.svg" width="700">
 </p>
-
-> 🚧 Chunky is in early development and actively evolving. Bugs may exist — if you find one, please open an [issue](https://github.com/GiovanniPasq/chunky/issues).
 
 > New to RAG? Check out [**Agentic RAG for Dummies**](https://github.com/GiovanniPasq/agentic-rag-for-dummies) — a hands-on implementation of Agentic RAG.
 
@@ -94,7 +90,7 @@ No single converter wins on every document type. Chunky ships with six — switc
 |-----------|---------|----------|
 | **PyMuPDF** | `pymupdf4llm` | Fast conversion of standard digital PDFs with selectable text |
 | **Docling** | `docling` | Complex layouts: multi-column documents, tables, and figures |
-| **MarkItDown** | `markitdown[all]` | Broad-format documents, simple and deterministic output |
+| **MarkItDown** | `markitdown[pdf]` | Broad-format documents, simple and deterministic output |
 | **LiteParse** | `liteparse` | Fast, lightweight parsing by LlamaIndex — good for standard documents |
 | **VLM** | `openai` + any vision model | Scanned PDFs, handwriting, diagrams — anything a human can read |
 | **Cloud API** | `httpx` | POSTs the PDF to a configurable external endpoint and returns the Markdown response body directly |
