@@ -4,7 +4,7 @@ import workerSrc from 'pdfjs-dist/build/pdf.worker.min.js?url'
 import { clamp, SCROLL_DEBOUNCE_MS } from '../../hooks/useScrollSync'
 import { VIEWER_SCROLL } from '../../utils/viewerEvents'
 import { PDF_DIM_BATCH as DIM_BATCH, PDF_RENDER_BUFFER as BUFFER } from '../../config'
-import Toast from './Toast'
+import Toast from '../Toast'
 import './PDFViewer.css'
 
 // Bundle the worker locally — no CDN dependency at runtime.

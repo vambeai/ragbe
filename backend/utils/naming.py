@@ -123,6 +123,25 @@ def md_source_token(md_filename: str | None, doc_stem: str) -> str:
     return "uploaded"
 
 
+def doc_stem_from_md(md_filename: str) -> str:
+    """Recover the document stem from a markdown variant filename.
+
+    ``report_vlm.md`` → ``report``;  ``multi_word_doc_cloud.md`` →
+    ``multi_word_doc``;  ``legacy.md`` → ``legacy``.  Strips one trailing
+    ``_{converter}`` segment when ``converter`` is a known converter token;
+    otherwise returns the stem unchanged.  Used by the document-summary
+    store so a summary file is shared across every converter variant of
+    the same source PDF.
+    """
+    stem = Path(md_filename).stem
+    if "_" not in stem:
+        return stem
+    head, _, tail = stem.rpartition("_")
+    if tail in KNOWN_CONVERTERS:
+        return head
+    return stem
+
+
 # ---------------------------------------------------------------------------
 # Sanitisation
 # ---------------------------------------------------------------------------

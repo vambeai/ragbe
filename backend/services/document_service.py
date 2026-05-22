@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException, UploadFile
 
+from backend.converters.vlm_checkpoint import CheckpointStore, discard_all_for_stem
+from backend.services.enrichment_checkpoint import discard_all_for_stem as discard_enrich_for_stem
+from backend.services.document_summary import discard_all_for_stem as discard_summary_for_stem
 from backend.converters.base import PDFConverter
 from backend.converters.cloud import CloudConverter
 from backend.converters.docling import DoclingConverter
@@ -50,6 +53,30 @@ from backend.utils.naming import KNOWN_CONVERTERS as _KNOWN_CONVERTERS, normalis
 from backend.utils.path import safe_child_path, safe_filename, safe_stem
 
 _ALLOWED_EXTENSIONS = {".pdf", ".md"}
+
+# Detection pattern for VLM partial-run placeholders.  Kept module-level so
+# the compiled regex is reused across many calls to ``list_markdown_versions``
+# in a single batch.
+import re as _re
+_FAILURE_MARKER_RE = _re.compile(r"<!--\s*page\s+\d+\s+failed:")
+
+
+def _file_has_failure_markers(path: Path) -> bool:
+    """Return True iff *path* contains at least one VLM failure placeholder.
+
+    Reads the file lazily until the first hit so very large documents don't
+    pay for a full read just to flag them.  Returns False on any read error
+    (missing file, encoding glitch) — the absence of a positive signal is
+    safer than surfacing a phantom warning.
+    """
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if _FAILURE_MARKER_RE.search(line):
+                    return True
+        return False
+    except OSError:
+        return False
 
 
 def _md_files_for_stem(mds_dir: Path, stem: str) -> list[Path]:
@@ -182,14 +209,22 @@ def _build_converter(
     cloud_settings: CloudSettings | None,
     on_progress: Callable[[int, int], None] | None = None,
     stop_event: threading.Event | None = None,
+    checkpoint_store: CheckpointStore | None = None,
 ) -> PDFConverter:
     """Instantiate the requested converter, forwarding runtime settings when relevant."""
     if converter_type == ConverterType.vlm:
         kwargs: dict = vlm_settings.model_dump(exclude_none=True) if vlm_settings else {}
+        # ``use_checkpoint`` is a service-level flag (controls whether the
+        # checkpoint store is constructed/cleared) and is not part of
+        # VLMConverter's constructor signature.  Drop it before unpacking so
+        # the converter doesn't reject the kwarg.
+        kwargs.pop("use_checkpoint", None)
         if on_progress:
             kwargs["on_progress"] = on_progress
         if stop_event is not None:
             kwargs["stop_event"] = stop_event
+        if checkpoint_store is not None:
+            kwargs["checkpoint_store"] = checkpoint_store
         return VLMConverter(**kwargs)
 
     if converter_type == ConverterType.cloud:
@@ -225,6 +260,25 @@ class DocumentService:
         self._pdfs_dir = Path(s.PDFS_DIR)
         self._mds_dir = Path(s.MDS_DIR)
         self._chunks_dir = Path(s.CHUNKS_DIR)
+
+    # ------------------------------------------------------------------
+    # Cleanup helpers
+    # ------------------------------------------------------------------
+
+    def _discard_derived_caches(self, stem: str) -> None:
+        """Wipe every on-disk cache derived from a source document.
+
+        Centralises the three cascade calls (VLM checkpoints, enrichment
+        checkpoints, document summaries) so adding a new cache tier later
+        only has to be wired into one place — call sites (upload-overwrite,
+        delete) can't accidentally forget one of the three.  Each underlying
+        ``discard_all_for_stem`` is independently best-effort: I/O failures
+        are logged but never raised, so cleanup of one tier never blocks
+        the others.
+        """
+        discard_all_for_stem(stem, self._mds_dir)
+        discard_enrich_for_stem(stem, self._mds_dir)
+        discard_summary_for_stem(stem, self._mds_dir)
 
     # ------------------------------------------------------------------
     # Read
@@ -264,19 +318,49 @@ class DocumentService:
         return sorted(results)
 
     def list_documents_metadata(self) -> list[dict]:
+        """Return per-document metadata for the sidebar listing.
+
+        ``has_failures`` is true when EITHER (a) a VLM checkpoint directory
+        survives on disk for the document — the usual "partial conversion"
+        signal — OR (b) the VLM markdown variant on disk contains one or
+        more failure placeholders.  Case (b) covers two paths that case
+        (a) misses: a conversion where *every* page failed (no successes,
+        therefore the checkpoint dir was never created) and a run whose
+        checkpoint was manually deleted while the placeholder-laden MD
+        remained.  Keeping both signals in sync keeps the sidebar warning
+        aligned with what the dropdown and in-viewer banner show.
+        Other converters never emit placeholders, so this check is
+        VLM-scoped.
+        """
         results = []
         pdf_stems: set[str] = set()
 
         if self._pdfs_dir.exists():
             for f in sorted(self._pdfs_dir.glob("*.pdf")):
-                has_md = bool(_md_files_for_stem(self._mds_dir, f.stem))
-                results.append({"filename": f.name, "has_markdown": has_md})
-                pdf_stems.add(f.stem)
+                stem = f.stem
+                has_md = bool(_md_files_for_stem(self._mds_dir, stem))
+                has_failures = CheckpointStore(stem, self._mds_dir).exists()
+                if not has_failures:
+                    vlm_md = self._mds_dir / f"{stem}_vlm.md"
+                    if vlm_md.exists() and _file_has_failure_markers(vlm_md):
+                        has_failures = True
+                results.append({
+                    "filename": f.name,
+                    "has_markdown": has_md,
+                    "has_failures": has_failures,
+                })
+                pdf_stems.add(stem)
 
         if self._mds_dir.exists():
             for f in sorted(self._mds_dir.glob("*.md")):
                 if not self._is_md_associated_with_pdf(f, pdf_stems):
-                    results.append({"filename": f.name, "has_markdown": True})
+                    # Standalone .md uploads can't have a VLM checkpoint —
+                    # they were never produced by a per-page converter.
+                    results.append({
+                        "filename": f.name,
+                        "has_markdown": True,
+                        "has_failures": False,
+                    })
 
         return results
 
@@ -338,6 +422,12 @@ class DocumentService:
         and the parsed converter token; uploaded files (whose name does not
         match the ``{stem}_{converter}.md`` pattern) are reported with
         ``source="uploaded"`` and ``converter=None``.
+
+        Each version also carries ``has_failures``: true iff the file
+        contains one or more ``<!-- page N failed: … -->`` placeholders
+        emitted by the VLM converter after a partial run.  The frontend
+        version picker uses this flag to mark the affected variant so the
+        user can tell at a glance which one is incomplete.
         """
         stem = safe_stem(document_name)
         if not self._mds_dir.exists():
@@ -353,6 +443,7 @@ class DocumentService:
                     source="converted",
                     converter=converter,
                     file_path=str(candidate),
+                    has_failures=_file_has_failure_markers(candidate),
                 ))
 
         # Uploaded / legacy: any .md whose name does not match the converter
@@ -366,6 +457,7 @@ class DocumentService:
                     source="uploaded",
                     converter=None,
                     file_path=str(f),
+                    has_failures=_file_has_failure_markers(f),
                 ))
                 continue
             suffix = f.stem[len(stem):]
@@ -379,6 +471,7 @@ class DocumentService:
                     source="uploaded",
                     converter=None,
                     file_path=str(f),
+                    has_failures=_file_has_failure_markers(f),
                 ))
 
         return versions
@@ -429,6 +522,26 @@ class DocumentService:
             detail=f"Markdown version '{identifier}' not found for '{document_name}'",
         )
 
+    def get_vlm_checkpoint_info(self, document_name: str) -> dict:
+        """Return the VLM checkpoint state for ``document_name``.
+
+        Used by the frontend to surface a "Resume available" indicator.  The
+        document need not currently exist on disk — if the PDF was deleted
+        with orphan checkpoint files left over (should not happen with the
+        regular ``delete_document`` flow, but kept defensive), ``exists`` is
+        reported truthfully and the caller can decide whether to discard.
+        """
+        stem = safe_stem(document_name)
+        store = CheckpointStore(stem, self._mds_dir)
+        # 1-indexed for the UI (page numbers shown to users start at 1).
+        completed = [p + 1 for p in store.completed_pages()]
+        return {
+            "document_name": document_name,
+            "converter": "vlm",
+            "exists": bool(completed),
+            "completed_pages": completed,
+        }
+
     def get_pdf_path(self, filename: str) -> Path:
         filename = safe_filename(filename, "PDF filename")
         pdf_path = self._pdfs_dir / filename
@@ -456,6 +569,11 @@ class DocumentService:
         size = 0
         buf_for_magic = bytearray()
         is_pdf_ext = name.lower().endswith(".pdf")
+        # Detect "uploading over an existing PDF" up-front; the actual stale-
+        # derivative cleanup is deferred to after the new file is fully
+        # written and validated so a failed upload doesn't destroy
+        # converted artifacts that still match the previous on-disk PDF.
+        was_overwrite = is_pdf_ext and dest_path.exists()
 
         try:
             with open(dest_path, "wb") as out:
@@ -490,6 +608,29 @@ class DocumentService:
                     status_code=422,
                     detail=f"'{name}' does not appear to be a valid PDF (magic bytes mismatch).",
                 )
+
+        # Stale-derivative cleanup: the user has replaced the source PDF, so
+        # every artifact that referenced the old content (converted MDs,
+        # in-flight checkpoints) is no longer trustworthy — cached pages
+        # would be misleading on a re-conversion.  Done only after the new
+        # PDF is fully written AND validated so a rejected upload preserves
+        # the previous state.
+        if was_overwrite:
+            stem = _stem(name)
+            for md_file in _md_files_for_stem(self._mds_dir, stem):
+                try:
+                    md_file.unlink()
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to remove stale MD '%s' after overwrite: %s",
+                        md_file, exc,
+                    )
+            self._discard_derived_caches(stem)
+            logger.info(
+                "Overwrote '%s' — wiped stale derivatives for stem '%s'",
+                name, stem,
+                extra={"operation": "upload", "file_name": name},
+            )
 
         logger.info(
             "Uploaded '%s' (%d KB)",
@@ -567,11 +708,35 @@ class DocumentService:
 
         # Build the per-converter Markdown filename now so we can short-circuit
         # if the same document+converter has already been converted before.
+        stem = _stem(filename)
         converter_token = _normalise_converter(converter_type.value)
-        md_filename = f"{_stem(filename)}_{converter_token}.md"
+        md_filename = f"{stem}_{converter_token}.md"
         md_path = self._mds_dir / md_filename
 
-        if md_path.exists():
+        # VLM-only: prepare the checkpoint store.  We snapshot the
+        # "is there a partial conversion?" signal BEFORE honouring the
+        # ``use_checkpoint`` opt-out — otherwise discarding the checkpoint
+        # would erase the only evidence that the previous run left a partial
+        # MD on disk, and the next branch would happily return that stale
+        # partial Markdown instead of running a fresh conversion.
+        checkpoint_store: CheckpointStore | None = None
+        had_partial_checkpoint = False
+        if converter_type == ConverterType.vlm and settings.VLM_CHECKPOINT_ENABLED:
+            checkpoint_store = CheckpointStore(stem, self._mds_dir)
+            had_partial_checkpoint = checkpoint_store.exists()
+            use_checkpoint = vlm_settings.use_checkpoint if vlm_settings is not None else True
+            if not use_checkpoint:
+                checkpoint_store.discard()
+
+        # A stored Markdown alone normally means "already converted, reuse" —
+        # but for VLM, a checkpoint dir surviving the previous run signals
+        # that the run completed with at least one failed page (we keep the
+        # dir to enable "retry failed pages").  In that case we must re-run
+        # so the cached failures get another attempt instead of returning a
+        # stale partial result.  The check uses the pre-discard snapshot so
+        # ``use_checkpoint=False`` still triggers a fresh conversion when
+        # the previous run was partial.
+        if md_path.exists() and not had_partial_checkpoint:
             logger.info(
                 "Skipping conversion of '%s' with '%s' — '%s' already exists",
                 filename, converter_type.value, md_filename,
@@ -603,6 +768,7 @@ class DocumentService:
                 cloud_settings,
                 on_progress=_progress_handler if _is_io_bound else None,
                 stop_event=stop_event if _is_io_bound else None,
+                checkpoint_store=checkpoint_store,
             )
             md_content = converter.convert(pdf_path, total_pages=page_count)
         except InterruptedError:
@@ -612,17 +778,39 @@ class DocumentService:
                 (time.monotonic() - t0) * 1000,
                 extra={"operation": "convert", "file_name": filename},
             )
+            # Checkpoint is intentionally preserved on cancellation so the
+            # next attempt can resume from the last persisted page.
             raise
 
+        # ── Extract per-page outcome from the VLM converter ──────────────────
+        # Other converters do not surface these attributes; default to None
+        # so the response shape stays uniform but uninformative for them.
+        failed_pages = getattr(converter, "failed_pages", None) or None
+        resumed_pages = (
+            getattr(converter, "resumed_from_pages", 0) if checkpoint_store else 0
+        ) or None
+
+        # Persist the final Markdown BEFORE deleting the checkpoint so a
+        # failure between the write and the cleanup leaves the cache intact
+        # for a retry — never the other way around.
         self._mds_dir.mkdir(parents=True, exist_ok=True)
         md_path.write_text(md_content, encoding="utf-8")
 
+        # Clean up the checkpoint only when the conversion is fully clean
+        # (no failed pages).  A partial conversion keeps its checkpoint so
+        # "retry failed pages" — which re-submits the same convert request
+        # — can resume the cached pages and re-attempt the failures.
+        if checkpoint_store is not None and not failed_pages:
+            checkpoint_store.discard()
+
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         logger.info(
-            "Conversion complete: '%s' → '%s' in %d ms",
+            "Conversion complete: '%s' → '%s' in %d ms (failed_pages=%s, resumed_pages=%s)",
             filename,
             md_filename,
             elapsed_ms,
+            failed_pages,
+            resumed_pages,
             extra={"operation": "convert", "file_name": filename, "duration_ms": elapsed_ms},
         )
         return ConvertResponse(
@@ -630,6 +818,8 @@ class DocumentService:
             md_filename=md_filename,
             message=f"Converted '{filename}' to Markdown using {converter_type.value}",
             md_content=md_content,
+            failed_pages=failed_pages,
+            resumed_pages=resumed_pages,
         )
 
     # ------------------------------------------------------------------
@@ -676,6 +866,14 @@ class DocumentService:
                 shutil.rmtree(chunks_path)
                 deleted.append(str(chunks_path))
 
+            # Same cascade cleanup the PDF branch performs.  Without this,
+            # deleting a converted variant (e.g. ``report_vlm.md``) leaks its
+            # enrichment-checkpoint dir, and deleting a bare-MD upload leaks
+            # its document-summary file as well.  The discards are stem-glob
+            # based so they only touch caches that belong to this MD: the
+            # shared per-PDF summary survives a converted-variant delete.
+            self._discard_derived_caches(stem)
+
             associated = len(deleted) - 1
             return DeleteResponse(
                 success=True,
@@ -696,6 +894,15 @@ class DocumentService:
                 deleted.append(str(md_file))
             except OSError:
                 pass
+
+        # Drop any checkpoint directories belonging to this stem.  They would
+        # otherwise become orphans referring to a PDF that no longer exists
+        # and would silently feed stale page content into the next document
+        # uploaded under the same name.  Both VLM and enrichment checkpoint
+        # dirs live under ``mds/.checkpoints/`` and must be cleaned together.
+        # Document summaries (``mds/{stem}_{converter}.summary.json``) follow
+        # the same lifecycle and are cleaned here as well.
+        self._discard_derived_caches(stem)
 
         chunks_path = self._chunks_dir / stem
         if chunks_path.exists():

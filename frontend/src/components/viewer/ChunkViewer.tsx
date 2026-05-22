@@ -27,6 +27,12 @@ interface Props {
   savingChunks: boolean
   scrollSyncEnabled?: boolean
   chunkEnrichment?: EnrichmentSettings
+  /**
+   * Active markdown variant filename.  Threaded into chunk enrichment
+   * so the backend can attach the cached per-PDF summary as context
+   * (Phase B).  Optional — no summary attachment when undefined.
+   */
+  mdFilename?: string
   onEnrichChunk: (index: number, updates: Partial<Chunk>) => void
   onChunkEdit: (index: number, content: string) => void
   onDeleteChunk: (index: number) => void
@@ -83,6 +89,7 @@ function ChunkViewer({
   savingChunks,
   scrollSyncEnabled = true,
   chunkEnrichment,
+  mdFilename,
   onEnrichChunk,
   onChunkEdit,
   onDeleteChunk,
@@ -113,6 +120,7 @@ function ChunkViewer({
     chunkEnrichment,
     chunks,
     content,
+    mdFilename,
     selectedChunks,
     onEnrichChunk,
     setEnrichError,

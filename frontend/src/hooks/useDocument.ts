@@ -13,7 +13,7 @@ import { listMarkdownVersions, getMarkdownContent } from '../services/markdownsA
 import { listChunksVersions } from '../services/chunksApi'
 
 export type BulkProgressFn = (current: number, total: number, filename: string) => void
-export type BulkResultFn = (filename: string, success: boolean) => void
+export type BulkResultFn = (filename: string, success: boolean, failedPages?: number[]) => void
 
 const API = API_BASE
 
@@ -256,6 +256,8 @@ export function useDocument(toast: ToastCallbacks) {
       let mdContent: string | undefined
       let mdFilename: string | undefined
       let fileError: string | undefined
+      let failedPages: number[] | undefined
+      let resumedPages: number | undefined
       for await (const event of parseSse(res.body, () => setConversionErrorMessage(CONNECTION_LOST_MSG))) {
         if (event.type === 'progress') {
           setConversionProgress({ active: true, current: event.current as number, total: event.total as number })
@@ -263,6 +265,8 @@ export function useDocument(toast: ToastCallbacks) {
           if (!event.success) { fileError = String(event.error ?? 'Conversion failed'); break }
           mdContent = event.md_content as string
           mdFilename = event.md_filename as string | undefined
+          failedPages = (event.failed_pages as number[] | null | undefined) ?? undefined
+          resumedPages = (event.resumed_pages as number | null | undefined) ?? undefined
           break
         } else if (event.type === 'error') {
           throw new Error(String(event.message ?? 'Conversion error'))
@@ -276,7 +280,17 @@ export function useDocument(toast: ToastCallbacks) {
       setDocumentData(prev => prev
         ? { ...prev, has_markdown: true, md_content: mdContent!, md_filename: mdFilename ?? prev.md_filename }
         : prev)
-      toastRef.current.onSuccess('Conversion complete ✓')
+      // Tailor the success toast so the user immediately sees whether any
+      // pages failed and whether the checkpoint shortened the run.  The
+      // MarkdownViewer banner provides the per-page detail and retry action.
+      if (failedPages && failedPages.length > 0) {
+        const tail = resumedPages ? ` (resumed ${resumedPages} cached)` : ''
+        toastRef.current.onError(`Converted with ${failedPages.length} failed page${failedPages.length !== 1 ? 's' : ''}${tail}`)
+      } else if (resumedPages && resumedPages > 0) {
+        toastRef.current.onSuccess(`Conversion complete ✓ (resumed ${resumedPages} cached pages)`)
+      } else {
+        toastRef.current.onSuccess('Conversion complete ✓')
+      }
       // A new converter-suffixed file may have been written — refresh the
       // version list AND sync the dropdown selection so it points to the file
       // that's actually being displayed (instead of whichever variant was
@@ -325,8 +339,15 @@ export function useDocument(toast: ToastCallbacks) {
       if (!res.ok) throw new Error()
       const data = await res.json()
       if (typeof data.pdf_filename !== 'string') throw new Error('Invalid response: missing pdf_filename')
-      if (selectedDocRef.current === docAtStart) setSelectedDoc(data.pdf_filename)
-      setDocumentData(prev => prev ? { ...prev, has_pdf: true, pdf_filename: data.pdf_filename } : prev)
+      // Both state updates must be gated by the same "is the user still on
+      // this doc?" check — otherwise a doc switch during conversion would
+      // leave the previous-conversion's PDF metadata stamped onto the new
+      // doc's ``documentData``, which would make the new doc claim it has
+      // a PDF it doesn't actually own.
+      if (selectedDocRef.current === docAtStart) {
+        setSelectedDoc(data.pdf_filename)
+        setDocumentData(prev => prev ? { ...prev, has_pdf: true, pdf_filename: data.pdf_filename } : prev)
+      }
       await fetchDocuments()
       toastRef.current.onSuccess('Converted to PDF ✓')
     } catch (err) {
@@ -404,7 +425,7 @@ export function useDocument(toast: ToastCallbacks) {
     vlm: VLMSettings | undefined,
     cloud: CloudSettings | undefined,
     onFileStart: (filename: string, index: number, total: number) => void,
-    onFileResult: (filename: string, success: boolean) => void,
+    onFileResult: (filename: string, success: boolean, failedPages?: number[]) => void,
     onBatchProgress: (current: number, total: number, filename: string, percentage: number) => void,
     signal?: AbortSignal,
     onConnectionLost?: () => void,
@@ -442,7 +463,11 @@ export function useDocument(toast: ToastCallbacks) {
           event.total as number,
         )
       } else if (event.type === 'file_done') {
-        onFileResult(event.filename as string, event.success as boolean)
+        onFileResult(
+          event.filename as string,
+          event.success as boolean,
+          (event.failed_pages as number[] | null | undefined) ?? undefined,
+        )
       } else if (event.type === 'file_progress') {
         onBatchProgress(
           event.current as number,

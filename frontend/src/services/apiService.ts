@@ -1,8 +1,55 @@
-import type { Capabilities, EnrichmentSettings } from '../types'
+import type {
+  Capabilities,
+  DocumentSummary,
+  DocumentSummaryResponse,
+  EnrichmentSettings,
+} from '../types'
 import { parseSse } from '../utils/parseSse'
 import { DEFAULT_ENRICHMENT_BASE_URL, DEFAULT_ENRICHMENT_TEMPERATURE } from '../hooks/useSettings'
+import { METADATA_FETCH_TIMEOUT_MS } from '../config'
 
 export const API_BASE = '/api'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Document metadata
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface DocumentMetadataEntry {
+  filename: string
+  has_markdown: boolean
+  has_failures?: boolean
+}
+
+/**
+ * Fetch the current document-list metadata used by the sidebar to flag
+ * which docs have a converted MD and which still have failures pending.
+ *
+ * Returns an empty array on any failure (network / abort / non-2xx).
+ * Caller is expected to feed the array into setDocsWithMarkdown +
+ * setDocsWithFailures; the shape is kept simple on purpose so the
+ * Set-building logic stays inline at the call site (it's the noisy
+ * part the helper is replacing — duplicating it across three effects
+ * is what hurts).
+ *
+ * ``errorContext`` is appended to the console.error message so the
+ * three call sites stay distinguishable in the dev console.
+ */
+export async function fetchDocumentMetadata(
+  errorContext: string,
+): Promise<DocumentMetadataEntry[]> {
+  try {
+    const res = await fetch('/api/documents/metadata', {
+      signal: AbortSignal.timeout(METADATA_FETCH_TIMEOUT_MS),
+    })
+    return res.ok ? await res.json() : []
+  } catch (err: unknown) {
+    const name = (err as { name?: string })?.name
+    if (name !== 'AbortError' && name !== 'TimeoutError') {
+      console.error(`Failed to ${errorContext}:`, err)
+    }
+    return []
+  }
+}
 
 /**
  * Map a wire-level converter name (the value used by the /api/convert
@@ -83,31 +130,124 @@ export const capabilityService = {
 }
 
 /**
- * Enrich a single markdown section via SSE.
- * Returns the enriched content string.
- * Throws on error; throws DOMException(AbortError) if cancelled/aborted.
+ * Per-piece pipeline event payloads streamed by /api/enrich/markdown/pipeline.
+ *
+ * The orchestrator emits ``cleanup_done``, ``split_done``, then a sequence of
+ * ``piece_start`` / ``piece_done`` events as each piece resolves, ending with
+ * ``done`` (containing the assembled enriched content and stats) or ``error``
+ * / ``cancelled``.  The hook that consumes this stream uses these payloads to
+ * drive a progress UI and the diff-preview modal.
  */
-export async function apiEnrichMarkdown(
+export interface PipelineProgress {
+  /** Result of the deterministic regex cleanup pass. */
+  cleanup?: Record<string, number>
+  /** Total number of pieces produced by the structure-aware splitter. */
+  totalPieces: number
+  /** Count of pieces that have finished (cache hit + LLM success + LLM failure). */
+  completedPieces: number
+  /** Count of pieces currently being processed by the LLM. */
+  inFlight: number
+  /** Count of pieces served from the checkpoint cache (subset of completedPieces). */
+  cachedPieces: number
+  /** 1-indexed piece numbers whose LLM call failed and fell back to the post-cleanup original. */
+  failedPieces: number[]
+}
+
+export interface PipelineResult {
+  enrichedContent: string
+  stats: {
+    pieces: number
+    cached_pieces: number
+    failed_pieces: number[]
+    cleanup: Record<string, number>
+    summary?: { present: boolean }
+  }
+}
+
+/**
+ * Run the full enrichment pipeline (regex + structure-aware split +
+ * per-piece LLM with rolling context + per-piece checkpoint) on a stored
+ * Markdown file.  Streams progress to the caller via ``onProgress`` and
+ * returns the enriched content + stats once the run completes.
+ *
+ * Throws on terminal errors.  Throws ``DOMException(AbortError)`` when the
+ * caller aborts via the supplied ``signal``.
+ */
+export async function apiEnrichMarkdownPipeline(
+  filename: string,
   settings: EnrichmentSettings,
-  content: string,
+  useCheckpoint: boolean,
+  useSummary: boolean,
+  onProgress: (state: PipelineProgress) => void,
   signal?: AbortSignal,
   onConnectionLost?: () => void,
-): Promise<string> {
-  const res = await fetch(`${API_BASE}/enrich/markdown`, {
+): Promise<PipelineResult> {
+  const res = await fetch(`${API_BASE}/enrich/markdown/pipeline`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
-    body: JSON.stringify(buildEnrichmentBody(settings, { content })),
+    body: JSON.stringify({
+      filename,
+      use_checkpoint: useCheckpoint,
+      use_summary: useSummary,
+      settings: {
+        model: settings.model,
+        base_url: settings.base_url ?? DEFAULT_ENRICHMENT_BASE_URL,
+        api_key: settings.api_key ?? 'ollama',
+        temperature: settings.temperature ?? DEFAULT_ENRICHMENT_TEMPERATURE,
+        user_prompt: settings.user_prompt,
+      },
+    }),
   })
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText)
-    throw new Error(`Enrichment failed ${res.status}: ${errText}`)
+    throw new Error(`Pipeline enrichment failed ${res.status}: ${errText}`)
   }
   if (!res.body) throw new Error('No response body')
+
+  const state: PipelineProgress = {
+    totalPieces: 0,
+    completedPieces: 0,
+    inFlight: 0,
+    cachedPieces: 0,
+    failedPieces: [],
+  }
+
   for await (const event of parseSse(res.body, onConnectionLost)) {
-    if (event.type === 'done') return event.enriched_content as string
-    if (event.type === 'error') throw new Error(String(event.message ?? 'Enrichment error'))
-    if (event.type === 'cancelled') throw new DOMException('Enrichment cancelled', 'AbortError')
+    switch (event.type) {
+      case 'start':
+        break
+      case 'cleanup_done':
+        state.cleanup = event.report as Record<string, number> | undefined
+        onProgress({ ...state })
+        break
+      case 'split_done':
+        state.totalPieces = (event.pieces as number) ?? 0
+        onProgress({ ...state })
+        break
+      case 'piece_start':
+        state.inFlight += 1
+        onProgress({ ...state })
+        break
+      case 'piece_done':
+        state.inFlight = Math.max(0, state.inFlight - 1)
+        state.completedPieces += 1
+        if (event.cached) state.cachedPieces += 1
+        if (event.succeeded === false) {
+          state.failedPieces = [...state.failedPieces, event.index as number]
+        }
+        onProgress({ ...state })
+        break
+      case 'done':
+        return {
+          enrichedContent: event.enriched_content as string,
+          stats: event.stats as PipelineResult['stats'],
+        }
+      case 'error':
+        throw new Error(String(event.message ?? 'Pipeline enrichment error'))
+      case 'cancelled':
+        throw new DOMException('Pipeline enrichment cancelled', 'AbortError')
+    }
   }
   throw new Error('Stream ended without a done event')
 }
@@ -126,13 +266,20 @@ export async function apiEnrichChunk(
   metadata: Record<string, unknown>,
   signal?: AbortSignal,
   onConnectionLost?: () => void,
+  mdFilename?: string,
 ): Promise<Record<string, unknown>> {
+  // ``mdFilename`` enables Phase B: backend looks up the cached
+  // document summary for the corresponding PDF and attaches it to
+  // every chunk-enrichment prompt as document-level context.  Absent
+  // (or no cached summary): chunks are enriched in isolation, same
+  // behaviour as before the feature.
   const res = await fetch(`${API_BASE}/enrich/chunks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
     body: JSON.stringify(buildEnrichmentBody(settings, {
       chunks: [{ index, content, start, end, metadata }],
+      ...(mdFilename ? { md_filename: mdFilename } : {}),
     })),
   })
   if (!res.ok) {
@@ -144,6 +291,151 @@ export async function apiEnrichChunk(
     if (event.type === 'chunk_done') return event.chunk as Record<string, unknown>
     if (event.type === 'error') throw new Error(String(event.message ?? 'Chunk enrichment error'))
     if (event.type === 'cancelled') throw new DOMException('Chunk enrichment cancelled', 'AbortError')
+  }
+  throw new Error('Stream ended without a done event')
+}
+
+
+// ---------------------------------------------------------------------------
+// Document summary endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the cached document summary for a markdown variant.  Returns
+ * ``null`` when no summary exists on disk — the review modal interprets
+ * that as "no summary yet, generate one to continue".
+ *
+ * Throws on non-404 errors.
+ */
+export async function apiGetSummary(filename: string): Promise<DocumentSummaryResponse | null> {
+  const url = `${API_BASE}/enrich/summary?filename=${encodeURIComponent(filename)}`
+  const res = await fetch(url)
+  if (res.status === 404) return null
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText)
+    throw new Error(`Load summary failed ${res.status}: ${errText}`)
+  }
+  return res.json()
+}
+
+/**
+ * Persist a user-edited summary.  The backend tags the record with
+ * ``user_edited=true`` so future enrichment runs treat the edit as
+ * authoritative until the next explicit Regenerate.
+ */
+export async function apiPutSummary(
+  filename: string,
+  summary: DocumentSummary,
+  signal?: AbortSignal,
+): Promise<DocumentSummaryResponse> {
+  const res = await fetch(`${API_BASE}/enrich/summary`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename, summary }),
+    signal,
+  })
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText)
+    throw new Error(`Save summary failed ${res.status}: ${errText}`)
+  }
+  return res.json()
+}
+
+
+/**
+ * Streamed progress events from ``/api/enrich/summary/generate``.  The
+ * shape matches the SSE wire payloads so the review modal can show a
+ * sensible progress UI while the map-reduce runs.
+ */
+export interface SummaryGenerateProgress {
+  stage: 'idle' | 'cleanup' | 'splitting' | 'extracting' | 'reducing' | 'done'
+  totalPieces: number
+  completedExtractions: number
+  cachedExtractions: number
+  cleanup?: Record<string, number>
+}
+
+/**
+ * Trigger summary generation.  When ``force`` is false and a cached
+ * record exists the backend short-circuits and returns it without LLM
+ * calls; when ``force`` is true it discards the cache and rebuilds via
+ * map-reduce.  Streams progress; resolves with the persisted record.
+ *
+ * Throws on terminal errors.  Throws ``DOMException(AbortError)`` when
+ * the caller aborts via ``signal``.
+ */
+export async function apiGenerateSummary(
+  filename: string,
+  settings: EnrichmentSettings,
+  force: boolean,
+  onProgress: (state: SummaryGenerateProgress) => void,
+  signal?: AbortSignal,
+  onConnectionLost?: () => void,
+): Promise<DocumentSummaryResponse> {
+  const res = await fetch(`${API_BASE}/enrich/summary/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      filename,
+      force,
+      settings: {
+        model: settings.model,
+        base_url: settings.base_url ?? DEFAULT_ENRICHMENT_BASE_URL,
+        api_key: settings.api_key ?? 'ollama',
+        temperature: settings.temperature ?? DEFAULT_ENRICHMENT_TEMPERATURE,
+        user_prompt: settings.user_prompt,
+      },
+    }),
+  })
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText)
+    throw new Error(`Summary generation failed ${res.status}: ${errText}`)
+  }
+  if (!res.body) throw new Error('No response body')
+
+  const state: SummaryGenerateProgress = {
+    stage: 'idle',
+    totalPieces: 0,
+    completedExtractions: 0,
+    cachedExtractions: 0,
+  }
+
+  for await (const event of parseSse(res.body, onConnectionLost)) {
+    switch (event.type) {
+      case 'start':
+        state.stage = 'cleanup'
+        onProgress({ ...state })
+        break
+      case 'cleanup_done':
+        state.cleanup = event.report as Record<string, number> | undefined
+        state.stage = 'splitting'
+        onProgress({ ...state })
+        break
+      case 'split_done':
+        state.totalPieces = (event.pieces as number) ?? 0
+        state.stage = 'extracting'
+        onProgress({ ...state })
+        break
+      case 'summary_progress':
+        state.totalPieces = (event.total as number) ?? state.totalPieces
+        state.completedExtractions = (event.current as number) ?? state.completedExtractions
+        if (event.cached) state.cachedExtractions += 1
+        onProgress({ ...state })
+        break
+      case 'summary_ready':
+        state.stage = 'reducing'
+        onProgress({ ...state })
+        break
+      case 'done':
+        state.stage = 'done'
+        onProgress({ ...state })
+        return event.summary as DocumentSummaryResponse
+      case 'error':
+        throw new Error(String(event.message ?? 'Summary generation error'))
+      case 'cancelled':
+        throw new DOMException('Summary generation cancelled', 'AbortError')
+    }
   }
   throw new Error('Stream ended without a done event')
 }

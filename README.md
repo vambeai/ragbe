@@ -45,7 +45,7 @@ As [NVIDIA's research](https://developer.nvidia.com/blog/finding-the-best-chunki
 | 📦 **Bulk PDF conversion** | Convert multiple PDFs to Markdown in a single batch operation |
 | ✂️ **14 chunking strategies** | LangChain (4 strategies), Chonkie (8 strategies) and Docling (2 strategies) |
 | 📚 **Bulk chunking** | Chunk multiple Markdown files at once with the same configuration |
-| 🧠 **Markdown enrichment** *(beta)* | Clean conversion artifacts before chunking |
+| 🧠 **Markdown enrichment** | Clean conversion artifacts before chunking |
 | ✨ **Chunk enrichment** *(beta)* | LLM-generated titles, summaries, keywords, and questions per chunk |
 | 🔌 **Pluggable architecture** | Add a converter or splitter in minutes — zero frontend changes |
 | 💾 **Export** | JSON chunks, ready for your vector store |
@@ -61,7 +61,7 @@ Two ways to run Chunky: locally or with Docker.
 git clone https://github.com/GiovanniPasq/chunky.git
 cd chunky
 python -m venv .venv
-source venv/bin/activate
+source .venv/bin/activate
 pip install -r requirements.txt
 npm install -g @llamaindex/liteparse  # optional — only needed for the LiteParse converter
 ./start_all.sh
@@ -148,17 +148,23 @@ Chunky supports two splitting libraries, each exposing multiple strategies. The 
 
 ---
 
-## Enrichment *(beta)*
+## Enrichment
 
-> ⚠️ Enrichment features are currently in beta and may change in future releases.
+> ⚠️ Chunk enrichment is currently in beta and may change in future releases.
 
 Chunky includes an LLM-powered enrichment layer that operates at two levels of the pipeline.
 
 ### Markdown enrichment
 
-Before chunking, you can run enrichment directly on the converted Markdown. This step cleans up residual conversion artifacts — noise, formatting inconsistencies, extraction errors — producing a polished document that leads to cleaner, more coherent chunks downstream.
+Before chunking, you can run enrichment directly on the converted Markdown. The pipeline:
 
-### Chunk enrichment
+1. **Regex pass** — automatically corrects common conversion artifacts (broken tables, stray escape characters, malformed headers)
+2. **LLM correction** — splits the document into pieces and sends each to an LLM for contextual cleanup, producing coherent, well-structured Markdown
+3. **Summary** *(optional)* — generates a document-level summary prepended to the cleaned output
+
+Markdown enrichment is available for both single files and **bulk operations**, so you can clean an entire batch of converted PDFs in one pass.
+
+### Chunk enrichment *(beta)*
 
 After chunking, each chunk can be enriched independently via an LLM call. The pipeline populates the following fields:
 

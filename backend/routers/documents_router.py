@@ -48,6 +48,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from backend.config import get_settings
 from backend.models.schemas import (
+    CheckpointInfoResponse,
     ConvertRequest,
     ConvertResponse,
     ConverterType,
@@ -65,7 +66,11 @@ from backend.services.document_service import (
     convert_md_to_pdf_in_process,
 )
 from backend.utils.executor import cancel_cpu_executor
-from backend.utils.sse import sse_error as _sse_error, sse_event as _sse, sse_timeout_tick
+from backend.utils.sse import (
+    run_sse_event_loop,
+    sse_error as _sse_error,
+    sse_event as _sse,
+)
 
 router = APIRouter(prefix="/api", tags=["documents"])
 _svc = DocumentService()
@@ -138,6 +143,24 @@ async def get_markdown_version(document_name: str, identifier: str):
     does not match the converter pattern).
     """
     return await asyncio.to_thread(_svc.get_markdown_content, document_name, identifier)
+
+
+# ── VLM checkpoint inspection ─────────────────────────────────────────────────
+
+@router.get(
+    "/documents/{document_name}/checkpoint",
+    response_model=CheckpointInfoResponse,
+)
+async def get_vlm_checkpoint(document_name: str):
+    """Return the VLM checkpoint state for a document.
+
+    The frontend calls this before kicking off a VLM conversion to decide
+    whether to surface a "Resume available" indicator alongside the
+    progress modal.  Reports ``exists=false`` (and an empty
+    ``completed_pages`` list) when no checkpoint is on disk.
+    """
+    info = await asyncio.to_thread(_svc.get_vlm_checkpoint_info, document_name)
+    return CheckpointInfoResponse(**info)
 
 
 # ── Upload ────────────────────────────────────────────────────────────────────
@@ -260,6 +283,8 @@ async def convert_pdfs(
                         "md_filename": result.md_filename,
                         "md_content": result.md_content,
                         "duration_ms": int((time.monotonic() - t0) * 1000),
+                        "failed_pages": result.failed_pages,
+                        "resumed_pages": result.resumed_pages,
                     })
                 except Exception as exc:
                     async with _lock:
@@ -324,58 +349,30 @@ async def convert_pdfs(
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
-        last_event = time.monotonic()
-        last_heartbeat = time.monotonic()
-
-        try:
-            while True:
-                if await http_request.is_disconnected():
-                    logger.info(
-                        "Client disconnected — cancelling %d conversion(s)",
-                        total,
-                        extra={"operation": "convert"},
-                    )
-                    await _cancel_all()
-                    yield _sse({"type": "cancelled"})
-                    return
-
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=queue_timeout_s)
-                except asyncio.TimeoutError:
-                    last_heartbeat, do_heartbeat, watchdog_fired = sse_timeout_tick(
-                        last_event, last_heartbeat, watchdog_s
-                    )
-                    if do_heartbeat:
-                        yield ": heartbeat\n\n"
-                    if watchdog_fired:
-                        logger.error(
-                            "SSE watchdog fired: no event for %.0fs — cancelling all conversions",
-                            watchdog_s,
-                            extra={"operation": "convert"},
-                        )
-                        await _cancel_all()
-                        yield _sse_error(504, f"No progress for {watchdog_s:.0f}s — operation timed out")
-                        return
-                    continue
-
-                if event is None:
-                    break
-
-                yield _sse(event)
-                last_event = last_heartbeat = time.monotonic()
-
-            yield _sse({"type": "batch_done", "succeeded": succeeded, "failed": failed})
-        except asyncio.CancelledError:
-            await _cancel_all()
-            yield _sse({"type": "cancelled"})
-        finally:
-            # Guarantee runner cleanup on any exit path (unexpected exceptions,
-            # return statements, CancelledError).  The explicit paths above
-            # already call _cancel_all(); here we just ensure the asyncio task
-            # itself is not leaked if an unhandled exception propagates.
+        async def _safe_cancel() -> None:
+            # Idempotent wrapper: the executor swap inside _cancel_all is
+            # heavy work; skip it once the runner has finished cleanly so
+            # the finally-block safety net stays a no-op on success.
             if not runner.done():
-                runner.cancel()
-                await asyncio.gather(runner, return_exceptions=True)
+                await _cancel_all()
+
+        def _handle(event: dict) -> tuple[str, bool]:
+            return _sse(event), False
+
+        def _on_complete():
+            return [_sse({"type": "batch_done", "succeeded": succeeded, "failed": failed})]
+
+        async for frame in run_sse_event_loop(
+            queue=queue,
+            http_request=http_request,
+            on_cancel=_safe_cancel,
+            handle_event=_handle,
+            watchdog_s=watchdog_s,
+            queue_timeout_s=queue_timeout_s,
+            log_name=f"conversion ({total} doc(s))",
+            on_complete=_on_complete,
+        ):
+            yield frame
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

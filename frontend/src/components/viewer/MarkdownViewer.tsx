@@ -1,12 +1,15 @@
-import { useRef, useEffect, useState, useMemo, memo } from 'react'
+import { useRef, useEffect, useState, useMemo, memo, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { EnrichmentSettings } from '../../types'
-import { useMarkdownEnrichment } from '../../hooks/useMarkdownEnrichment'
 import { useScrollSync } from '../../hooks/useScrollSync'
 import { VIEWER_PAGE_SYNC } from '../../utils/viewerEvents'
 import { LAZY_OBSERVER_MARGIN, LAZY_SECTION_TARGET_CHARS } from '../../config'
 import ProgressModal from '../modals/ProgressModal'
+import EnrichDiffModal from '../modals/EnrichDiffModal'
+import SummaryReviewModal from '../modals/SummaryReviewModal'
+import { apiEnrichMarkdownPipeline, type PipelineProgress, type PipelineResult } from '../../services/apiService'
+import { missingEnrichmentModelError } from '../../utils/chunkUtils'
 import './MarkdownViewer.css'
 
 interface Props {
@@ -25,11 +28,19 @@ interface Props {
   /** User-facing label for the active converter (shown on the Convert
    *  button so the user knows which method will run). */
   converterLabel: string
+  /** Canonical converter id ("vlm", "pymupdf", …) — used to gate
+   *  VLM-specific affordances like the "Retry failed pages" action. */
+  activeConverter: string
   converting: boolean
   savingMd: boolean
   sectionEnrichment?: EnrichmentSettings
   onEnrichSuccess?: (msg: string) => void
   onEnrichError?: (msg: string) => void
+  /** Filename of the markdown variant currently displayed.  Required by
+   *  the pipeline enrichment endpoint — the backend loads the source
+   *  content from disk so the checkpoint key stays stable across
+   *  requests. */
+  mdFilename?: string
 }
 
 // ── Page-marker helpers ─────────────────────────────────────────────────────
@@ -107,40 +118,156 @@ function MarkdownViewer({
   content, scale = 1.0, padding = 20,
   scrollSyncEnabled = true,
   onSaveMarkdown, onDeleteMarkdown,
-  onConvert, converterLabel, converting,
+  onConvert, converterLabel, activeConverter, converting,
   savingMd,
   sectionEnrichment,
   onEnrichSuccess, onEnrichError,
+  mdFilename,
 }: Props) {
   const [editMode, setEditMode] = useState(false)
   const [editContent, setEditContent] = useState(content)
   const [enrichError, setEnrichError] = useState<string | null>(null)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
 
-  const {
-    mdEnrichOp,
-    preEnrichContent,
-    pickerOpen,
-    pickerBlocks,
-    pickerSelected,
-    setPickerOpen,
-    setPickerSelected,
-    handleInterruptMdEnrich,
-    handleEnrichSection,
-    handleUndoEnrich,
-    clearPreEnrich,
-    confirmPicker,
-  } = useMarkdownEnrichment({
-    sectionEnrichment,
-    editMode,
-    editContent,
-    content,
-    setEditContent,
-    setEditMode,
-    setEnrichError,
-    onSuccess: onEnrichSuccess,
-    onError: onEnrichError,
-  })
+  // ── Pipeline enrichment state ────────────────────────────────────────────
+  // Streams `cleanup_done` → `split_done` → `piece_done` × N → `done`.
+  // The diff modal appears after `done`; the user accepts (writes to disk)
+  // or rejects (discards the enriched output, keeps original).
+  const [pipelineProgress, setPipelineProgress] = useState<PipelineProgress | null>(null)
+  const [pipelineResult, setPipelineResult] = useState<PipelineResult | null>(null)
+  const [pipelineSaving, setPipelineSaving] = useState(false)
+  const pipelineAbortRef = useRef<AbortController | null>(null)
+  useEffect(() => () => { pipelineAbortRef.current?.abort() }, [])
+
+  // Enrich is a two-step flow: clicking the button (usually) opens the
+  // SummaryReviewModal where the user inspects / edits / regenerates the
+  // per-document summary.  Only after they click "Confirm & enrich" does
+  // the actual pipeline kick off.  The modal handles its own PUT to
+  // persist edits before this runs, so by the time we get here the
+  // summary on disk is the one the user approved.
+  //
+  // The Settings → "Skip document summary" checkbox short-circuits this
+  // flow: when on, clicking Enrich runs the pipeline directly with the
+  // summary disabled (use_summary=false on the request).  No modal.
+  const [summaryModalOpen, setSummaryModalOpen] = useState(false)
+
+  const handleOpenEnrich = useCallback(() => {
+    if (!sectionEnrichment?.model) {
+      setEnrichError(missingEnrichmentModelError('Section Enrichment'))
+      return
+    }
+    if (!mdFilename) {
+      setEnrichError('No Markdown file selected.')
+      return
+    }
+    setEnrichError(null)
+    if (sectionEnrichment.skip_summary) {
+      // Setting overrides the per-run modal entirely.
+      startPipelineAfterReview(false)
+      return
+    }
+    setSummaryModalOpen(true)
+  }, [sectionEnrichment, mdFilename])
+
+  const startPipelineAfterReview = useCallback(async (useSummary: boolean) => {
+    if (!mdFilename || !sectionEnrichment) return
+    pipelineAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    pipelineAbortRef.current = ctrl
+
+    setPipelineProgress({
+      totalPieces: 0,
+      completedPieces: 0,
+      inFlight: 0,
+      cachedPieces: 0,
+      failedPieces: [],
+    })
+
+    const enrichSettings: EnrichmentSettings = sectionEnrichment
+    try {
+      const useCheckpoint = enrichSettings.use_checkpoint ?? true
+      const result = await apiEnrichMarkdownPipeline(
+        mdFilename,
+        enrichSettings,
+        useCheckpoint,
+        useSummary,
+        progress => setPipelineProgress(progress),
+        ctrl.signal,
+        () => { /* connection-lost: parseSse aborts the loop; we surface below */ },
+      )
+      // Always show the diff modal — even when the document is byte-identical
+      // (no changes).  That way the user gets explicit confirmation that the
+      // pipeline ran and found nothing to fix, instead of a silent no-op.
+      setPipelineResult(result)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        // user-initiated cancel — silent
+      } else {
+        onEnrichError?.(err instanceof Error ? err.message : 'Pipeline enrichment failed')
+      }
+    } finally {
+      if (pipelineAbortRef.current === ctrl) {
+        pipelineAbortRef.current = null
+        setPipelineProgress(null)
+      }
+    }
+  }, [sectionEnrichment, mdFilename, onEnrichError])
+
+  const handleConfirmSummary = useCallback((useSummary: boolean) => {
+    // Modal already PUT any edits before invoking this callback, so we
+    // just need to fire the enrichment pipeline.  ``useSummary`` echoes
+    // whichever button the user clicked: ``true`` for Confirm & enrich
+    // (the pipeline loads the persisted summary), ``false`` for Skip
+    // in the empty state (the pipeline runs without any summary).
+    startPipelineAfterReview(useSummary)
+  }, [startPipelineAfterReview])
+
+  const handleInterruptPipeline = useCallback(() => {
+    pipelineAbortRef.current?.abort()
+    setPipelineProgress(null)
+  }, [])
+
+  // The modal owns the (possibly user-edited) buffer and hands it to us
+  // when the user clicks Accept.  Saving uses that buffer, not the raw
+  // pipeline output, so manual edits in the diff modal are persisted.
+  const handleAcceptPipeline = useCallback(async (content: string) => {
+    setPipelineSaving(true)
+    try {
+      await onSaveMarkdown(content)
+      onEnrichSuccess?.('Enrichment applied ✓')
+      setPipelineResult(null)
+    } catch {
+      onEnrichError?.('Failed to save enriched markdown')
+    } finally {
+      setPipelineSaving(false)
+    }
+  }, [onSaveMarkdown, onEnrichSuccess, onEnrichError])
+
+  const handleRejectPipeline = useCallback(() => {
+    setPipelineResult(null)
+  }, [])
+
+  // The progress modal's "current/total" needs a sensible value before the
+  // splitter finishes: while we only know we're in the cleanup stage, show
+  // an indeterminate bar (total=0).  After split_done we have the real total.
+  // The pipeline no longer builds the summary inline — that runs from the
+  // SummaryReviewModal before this even starts — so progress here is just
+  // cleanup → per-piece corrections.
+  const pipelineCurrent = pipelineProgress?.completedPieces ?? 0
+  const pipelineTotal = pipelineProgress?.totalPieces ?? 0
+  // Detail text reports the number of pieces *finished*, not pieces started.
+  // The backend emits a ``piece_start`` event the moment each task spins up,
+  // and all N tasks are created at once before the first one acquires the
+  // concurrency semaphore — so a naive "started so far" counter races to N
+  // immediately and freezes there.  Using ``completedPieces`` instead means
+  // the number rises in lockstep with the progress bar.
+  const pipelineDetail = pipelineProgress
+    ? pipelineTotal === 0
+      ? 'Cleaning markdown…'
+      : `${pipelineCurrent} of ${pipelineTotal} piece${pipelineTotal === 1 ? '' : 's'} corrected` +
+        (pipelineProgress.cachedPieces > 0 ? ` · ${pipelineProgress.cachedPieces} from cache` : '') +
+        (pipelineProgress.failedPieces.length > 0 ? ` · ${pipelineProgress.failedPieces.length} failed` : '')
+    : ''
 
   const containerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -166,6 +293,27 @@ function MarkdownViewer({
   }, [content])
 
   const hasPageSync = lazyContent.type === 'paged'
+
+  // ── Failed-page detection ────────────────────────────────────────────────
+  // The VLM converter emits ``<!-- page N failed: <error> -->`` placeholders
+  // for pages that could not be transcribed.  Surface these to the user
+  // with a banner + a retry button (which re-runs the conversion; the
+  // backend's checkpoint logic skips successful pages automatically).
+  const failedPages = useMemo<number[]>(() => {
+    const re = /<!--\s*page\s+(\d+)\s+failed:/g
+    const out: number[] = []
+    let m: RegExpExecArray | null
+    while ((m = re.exec(content)) !== null) {
+      const n = parseInt(m[1], 10)
+      if (!Number.isNaN(n)) out.push(n)
+    }
+    return Array.from(new Set(out)).sort((a, b) => a - b)
+  }, [content])
+
+  const formatFailedPages = (pages: number[]): string => {
+    if (pages.length <= 8) return pages.join(', ')
+    return `${pages.slice(0, 6).join(', ')}, … (+${pages.length - 6} more)`
+  }
 
   // Listen for page-sync events from the PDF viewer.
   useEffect(() => {
@@ -234,7 +382,6 @@ function MarkdownViewer({
     }
     await onSaveMarkdown(editContent)
     setEditMode(false)
-    clearPreEnrich()
   }
 
   const handleCancelEdit = () => {
@@ -245,7 +392,6 @@ function MarkdownViewer({
     }
     setEditContent(content)
     setEditMode(false)
-    clearPreEnrich()
     setEnrichError(null)
   }
 
@@ -269,66 +415,45 @@ function MarkdownViewer({
 
   return (
     <div className="md-viewer-wrapper">
-      {/* Section enrichment progress modal */}
+      {/* Enrichment progress modal — driven by the pipeline endpoint
+          (regex cleanup + structure-aware split + per-piece LLM with
+          rolling context). */}
       <ProgressModal
-        isOpen={!!mdEnrichOp}
-        title={mdEnrichOp?.title ?? ''}
-        detail={mdEnrichOp?.detail}
-        current={mdEnrichOp?.current ?? 0}
-        total={mdEnrichOp?.total ?? 0}
-        onInterrupt={handleInterruptMdEnrich}
-        errorMessage={mdEnrichOp?.errorMessage}
+        isOpen={pipelineProgress !== null}
+        title="Enrichment"
+        detail={pipelineDetail}
+        current={pipelineCurrent}
+        total={pipelineTotal}
+        onInterrupt={handleInterruptPipeline}
       />
 
-      {/* Section picker */}
-      {pickerOpen && (
-        <div className="section-picker-overlay" onClick={() => setPickerOpen(false)}>
-          <div className="section-picker" onClick={e => e.stopPropagation()}>
-            <div className="section-picker-header">
-              <h3>Select Sections to Enrich</h3>
-              <button className="section-picker-close" onClick={() => setPickerOpen(false)}>✕</button>
-            </div>
-            <div className="section-picker-body">
-              <div className="section-picker-actions">
-                <button onClick={() => setPickerSelected(new Set(pickerBlocks.map((_, i) => i)))}>
-                  Select all
-                </button>
-                <button onClick={() => setPickerSelected(new Set())}>
-                  Deselect all
-                </button>
-              </div>
-              <div className="section-picker-list">
-                {pickerBlocks.map((block, i) => (
-                  <label key={i} className="section-picker-item">
-                    <input
-                      type="checkbox"
-                      checked={pickerSelected.has(i)}
-                      onChange={() => {
-                        const next = new Set(pickerSelected)
-                        next.has(i) ? next.delete(i) : next.add(i)
-                        setPickerSelected(next)
-                      }}
-                    />
-                    <span className="section-picker-label">
-                      {block.heading.replace(/^#{1,6}\s+/, '') || 'Introduction'}
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div className="section-picker-footer">
-              <button className="btn-secondary" onClick={() => setPickerOpen(false)}>Cancel</button>
-              <button
-                className="btn-primary"
-                disabled={pickerSelected.size === 0}
-                onClick={confirmPicker}
-              >
-                Enrich {pickerSelected.size} block{pickerSelected.size !== 1 ? 's' : ''}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Diff preview — shown after the pipeline completes; the user
+          must explicitly accept before the enriched content is written
+          to disk. */}
+      <EnrichDiffModal
+        isOpen={pipelineResult !== null}
+        original={editMode ? editContent : content}
+        result={pipelineResult}
+        onAccept={handleAcceptPipeline}
+        onReject={handleRejectPipeline}
+        onClose={handleRejectPipeline}
+        saving={pipelineSaving}
+      />
+
+      {/* Summary Review modal — the first step of the Enrich flow.  Lets
+          the user inspect, edit, or regenerate the per-document summary
+          before any piece-correction LLM calls run.  Confirming starts
+          the enrichment pipeline; cancelling closes without enriching. */}
+      <SummaryReviewModal
+        isOpen={summaryModalOpen}
+        filename={mdFilename ?? null}
+        settings={sectionEnrichment ?? {}}
+        onClose={() => setSummaryModalOpen(false)}
+        onConfirm={useSummary => {
+          setSummaryModalOpen(false)
+          handleConfirmSummary(useSummary)
+        }}
+      />
 
       {/* Delete confirmation dialog */}
       {showDeleteConfirm && (
@@ -371,8 +496,9 @@ function MarkdownViewer({
                 </button>
                 <button
                   className="md-action-btn enrich"
-                  onClick={handleEnrichSection}
-                  title="Enrich markdown with LLM"
+                  onClick={handleOpenEnrich}
+                  title="Review the document summary, then clean and LLM-correct the markdown piece-by-piece. Preview the diff before saving."
+                  disabled={pipelineProgress !== null || pipelineResult !== null || summaryModalOpen}
                 >
                   ✨ Enrich
                 </button>
@@ -381,16 +507,12 @@ function MarkdownViewer({
               <>
                 <button
                   className="md-action-btn enrich"
-                  onClick={handleEnrichSection}
-                  title="Enrich markdown with LLM"
+                  onClick={handleOpenEnrich}
+                  title="Review the document summary, then clean and LLM-correct the markdown piece-by-piece. Preview the diff before saving."
+                  disabled={pipelineProgress !== null || pipelineResult !== null || summaryModalOpen}
                 >
                   ✨ Enrich
                 </button>
-                {preEnrichContent !== null && (
-                  <button className="md-action-btn undo-enrich" onClick={handleUndoEnrich} title="Undo enrichment">
-                    ↩ Undo
-                  </button>
-                )}
                 <button className="md-action-btn save-md" onClick={handleSaveMd} disabled={savingMd}>
                   {savingMd ? '⏳ Saving…' : '💾 Save'}
                 </button>
@@ -408,6 +530,34 @@ function MarkdownViewer({
           <button className="enrich-error-close" onClick={() => setEnrichError(null)}>✕</button>
         </div>
       )}
+
+      {/* VLM partial-conversion banner — surfaces failed pages and offers
+          a one-click retry. Re-running the conversion is safe: the backend
+          skips already-cached pages from the checkpoint and re-attempts
+          only the failures. The retry button is gated on the active
+          converter being VLM, otherwise clicking it would silently run a
+          different converter (which couldn't reuse the VLM checkpoint).*/}
+      {failedPages.length > 0 && (() => {
+        const canRetry = activeConverter === 'vlm'
+        return (
+          <div className="failed-pages-banner">
+            <span>
+              ⚠️ {failedPages.length} page{failedPages.length !== 1 ? 's' : ''} failed transcription:
+              {' '}<strong>{formatFailedPages(failedPages)}</strong>
+            </span>
+            <button
+              className="failed-pages-retry"
+              onClick={onConvert}
+              disabled={converting || !canRetry}
+              title={canRetry
+                ? 'Re-run conversion. Successful pages are reused from the checkpoint; failed pages are retried.'
+                : 'Switch the converter to VLM in Settings to retry failed pages.'}
+            >
+              ↻ Retry failed pages
+            </button>
+          </div>
+        )
+      })()}
 
       {/* Viewer / editor */}
       <div

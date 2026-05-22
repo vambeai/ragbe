@@ -16,15 +16,19 @@ trap cleanup EXIT INT TERM
 
 # Start backend
 echo "Starting FastAPI backend..."
-source venv/bin/activate
-python -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
+VENV_DIR="${VENV_DIR:-.venv}"
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "Error: '$VENV_DIR/bin/python' not found. Create the venv or set VENV_DIR." >&2
+    exit 1
+fi
+"$VENV_DIR/bin/python" -m uvicorn backend.main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 echo "Backend started (PID: $BACKEND_PID) at http://localhost:8000"
 echo ""
 
 # Wait for backend to be ready
 echo "Waiting for backend to be ready..."
-until curl -s http://localhost:8000/health > /dev/null 2>&1; do
+until curl -s http://localhost:8000/api/health > /dev/null 2>&1; do
     sleep 1
 done
 echo "Backend is ready!"

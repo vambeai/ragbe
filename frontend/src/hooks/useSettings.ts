@@ -60,9 +60,29 @@ export const DEFAULT_VLM_PROMPT =
 **Output Format:**
 Return raw markdown with no wrapper, no code blocks, no explanations. Start immediately with the page content.`
 
-/** Default system prompt for markdown enrichment (mirrors `_MARKDOWN_SYSTEM` in enrichment_service.py). */
+/** Default system prompt for the markdown enrichment pipeline (mirrors
+ *  `_PIECE_SYSTEM` in enrichment_service.py).  Deliberately conservative:
+ *  the pipeline already runs a deterministic regex cleanup pass before
+ *  the LLM sees the content, so the LLM should bias toward inaction
+ *  rather than rewriting prose that already reads cleanly. */
 export const DEFAULT_SECTION_PROMPT =
-`You are a markdown document quality specialist. Your task is to improve markdown documents that were converted from PDFs. Correct conversion artifacts, fix broken formatting, remove duplicate or garbled content, and improve readability while strictly preserving all original information. Return ONLY the corrected markdown — no commentary, no code fences.`
+`You repair markdown that was converted from a PDF. You are conservative: if the text already reads cleanly, return it byte-for-byte unchanged. Only fix obvious conversion artifacts:
+  - OCR errors that produce nonsensical character sequences
+  - Sentences fragmented across line breaks mid-word or mid-clause
+  - Misordered fragments from multi-column layout
+  - Broken markdown syntax (unclosed tables, malformed lists)
+
+NEVER:
+  - Rephrase, summarise, or expand correct content
+  - Fix grammar, style, or capitalization choices in the source
+  - Add information not present in the source
+  - Remove information present in the source (including unusual formatting, dates, numbers, names)
+  - Change heading levels, code blocks, or table structure
+  - Translate or modernise the language
+
+If unsure whether something is an error or intentional, LEAVE IT UNCHANGED. Under-correction is preferred over over-correction.
+
+Return ONLY the corrected markdown of the SECTION provided. Do not include the preceding context in your output. No commentary. No code fences around the result.`
 
 /** Default system prompt for chunk enrichment (mirrors `_CHUNK_SYSTEM` in enrichment_service.py). */
 export const DEFAULT_CHUNK_PROMPT =
@@ -111,6 +131,7 @@ export const DEFAULT_SETTINGS: ChunkSettings = {
     api_key: DEFAULT_VLM_API_KEY,
     temperature: DEFAULT_VLM_TEMPERATURE,
     user_prompt: DEFAULT_VLM_PROMPT,
+    use_checkpoint: true,
   },
   sectionEnrichment: {
     model: DEFAULT_ENRICHMENT_MODEL,
@@ -118,6 +139,8 @@ export const DEFAULT_SETTINGS: ChunkSettings = {
     api_key: 'ollama',
     temperature: DEFAULT_ENRICHMENT_TEMPERATURE,
     user_prompt: DEFAULT_SECTION_PROMPT,
+    use_checkpoint: true,
+    skip_summary: false,
   },
   chunkEnrichment: {
     model: DEFAULT_ENRICHMENT_MODEL,

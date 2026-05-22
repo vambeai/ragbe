@@ -230,13 +230,33 @@ export default function SettingsModal({ isOpen, onClose, onSave, current }: Prop
                     <div className="vlm-settings">
                       <LLMSettingsPanel
                         value={settings.vlm ?? {}}
-                        onChange={vlm => setSettings(prev => ({ ...prev, vlm }))}
+                        onChange={vlm => setSettings(prev => ({ ...prev, vlm: { ...prev.vlm, ...vlm } }))}
                         defaultModel={DEFAULT_VLM_MODEL}
                         defaultBaseUrl={DEFAULT_VLM_BASE_URL}
                         defaultTemperature={DEFAULT_VLM_TEMPERATURE}
                         promptLabel="Prompt"
                         promptRows={5}
                       />
+
+                      <div className="form-group">
+                        <label className="checkbox-label">
+                          <input
+                            type="checkbox"
+                            checked={settings.vlm?.use_checkpoint ?? true}
+                            onChange={e => setSettings(prev => ({
+                              ...prev,
+                              vlm: { ...prev.vlm, use_checkpoint: e.target.checked },
+                            }))}
+                          />
+                          <span>
+                            Resume from checkpoint if available
+                            <span className="label-hint">
+                              {' '}— picks up an interrupted conversion at the last cached page.
+                              Uncheck to discard the checkpoint and reconvert from page 1.
+                            </span>
+                          </span>
+                        </label>
+                      </div>
                     </div>
                   )}
                 </>

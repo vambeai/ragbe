@@ -1,7 +1,11 @@
 import { useState, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import type { BulkProgressFn, BulkResultFn } from '../../hooks/useDocument'
 import logoSrc from '../../assets/logo.png'
 import './Sidebar.css'
+
+const WARNING_TOOLTIP_TEXT =
+  'Partial VLM conversion — some pages failed or the run was interrupted. Click Convert again to retry.'
 
 interface Props {
   documents: string[]
@@ -14,12 +18,25 @@ interface Props {
   onDelete: (filenames: string[]) => Promise<void>
   onBulkConvert?: (filenames: string[], onProgress: BulkProgressFn, onResult: BulkResultFn) => Promise<void>
   onBulkChunk?: (filenames: string[], onProgress: BulkProgressFn, onResult: BulkResultFn) => Promise<void>
+  /**
+   * Optional bulk markdown enrichment.  Available when the sidebar is
+   * given a handler; the corresponding button is hidden otherwise.
+   * Selected files without any markdown variant are skipped at runtime
+   * by the handler (mirrors the Chunk button's behaviour).
+   */
+  onBulkEnrich?: (filenames: string[], onProgress: BulkProgressFn, onResult: BulkResultFn) => Promise<void>
   onOpenSettings?: () => void
   docsWithMarkdown?: Set<string>
+  /**
+   * PDFs whose last VLM conversion ended with at least one failed page.
+   * Rendered as a warning icon next to the document name so partial
+   * conversions are visible without opening the file.
+   */
+  docsWithFailures?: Set<string>
 }
 
 interface BulkOpState {
-  type: 'convert' | 'chunk'
+  type: 'convert' | 'chunk' | 'enrich'
   current: number
   total: number
   currentFile: string
@@ -29,15 +46,24 @@ interface BulkOpState {
 export default function Sidebar({
   documents, selectedDoc, onSelect, onUpload, uploading,
   collapsed, onToggleCollapse, onDelete,
-  onBulkConvert, onBulkChunk,
-  onOpenSettings, docsWithMarkdown,
+  onBulkConvert, onBulkChunk, onBulkEnrich,
+  onOpenSettings, docsWithMarkdown, docsWithFailures,
 }: Props) {
   const [search, setSearch] = useState('')
   const [selectMode, setSelectMode] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [deleting, setDeleting] = useState(false)
   const [bulkOp, setBulkOp] = useState<BulkOpState | null>(null)
+  const [dragOver, setDragOver] = useState(false)
+  const [warningTip, setWarningTip] = useState<{ x: number; y: number } | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const dragDepthRef = useRef(0)
+
+  const showWarningTip = (e: React.MouseEvent<HTMLSpanElement> | React.FocusEvent<HTMLSpanElement>) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    setWarningTip({ x: r.right, y: r.top })
+  }
+  const hideWarningTip = () => setWarningTip(null)
 
   const filtered = documents.filter(d => d.toLowerCase().includes(search.toLowerCase()))
 
@@ -45,6 +71,43 @@ export default function Sidebar({
     const files = Array.from(e.target.files ?? [])
     if (files.length > 0) onUpload(files)
     e.target.value = ''
+  }
+
+  const acceptFile = (f: File) => /\.(pdf|md)$/i.test(f.name)
+
+  const handleDragEnter = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (uploading) return
+    dragDepthRef.current += 1
+    setDragOver(true)
+  }
+
+  const handleDragOver = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    if (uploading) {
+      e.dataTransfer.dropEffect = 'none'
+    } else {
+      e.dataTransfer.dropEffect = 'copy'
+    }
+  }
+
+  const handleDragLeave = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) setDragOver(false)
+  }
+
+  const handleDrop = (e: React.DragEvent<HTMLLabelElement>) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragDepthRef.current = 0
+    setDragOver(false)
+    if (uploading) return
+    const files = Array.from(e.dataTransfer.files ?? []).filter(acceptFile)
+    if (files.length > 0) onUpload(files)
   }
 
   const toggleSelectMode = () => {
@@ -82,10 +145,12 @@ export default function Sidebar({
     }
   }
 
-  const runBulkOp = async (type: 'convert' | 'chunk', handler: typeof onBulkConvert) => {
+  const runBulkOp = async (type: BulkOpState['type'], handler: typeof onBulkConvert) => {
     if (!handler || selected.size === 0) return
-    // For chunking, skip files that have no markdown yet.
-    const filenames = type === 'chunk'
+    // Chunking and enrichment both require markdown — skip files
+    // without any variant on disk.  Conversion takes the raw PDF
+    // list as-is.
+    const filenames = (type === 'chunk' || type === 'enrich')
       ? Array.from(selected).filter(f => docsWithMarkdown?.has(f))
       : Array.from(selected)
     if (filenames.length === 0) return
@@ -146,10 +211,19 @@ export default function Sidebar({
                 onChange={handleFiles}
                 style={{ display: 'none' }}
               />
-              <label htmlFor="file-upload" className="upload-btn">
+              <label
+                htmlFor="file-upload"
+                className={`upload-btn${dragOver ? ' drag-over' : ''}`}
+                onDragEnter={handleDragEnter}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
+              >
                 {uploading
                   ? <><span>⏳</span> Uploading…</>
-                  : <><span>📤</span> Upload PDF / MD</>}
+                  : dragOver
+                    ? <><span>📥</span> Drop to upload</>
+                    : <><span>📤</span> Upload PDF / MD</>}
               </label>
             </div>
 
@@ -201,7 +275,7 @@ export default function Sidebar({
                   </button>
                 </div>
 
-                {(onBulkConvert || onBulkChunk) && (
+                {(onBulkConvert || onBulkChunk || onBulkEnrich) && (
                   <div className="bulk-actions bulk-actions-secondary">
                     {onBulkConvert && (
                       <button
@@ -229,13 +303,29 @@ export default function Sidebar({
                         </button>
                       )
                     })()}
+                    {onBulkEnrich && (() => {
+                      const enrichable = Array.from(selected).filter(f => docsWithMarkdown?.has(f)).length
+                      return (
+                        <button
+                          className="bulk-btn enrich-selected"
+                          onClick={() => runBulkOp('enrich', onBulkEnrich)}
+                          disabled={enrichable === 0 || isBusy}
+                          title={selected.size > enrichable ? `${selected.size - enrichable} selected file(s) have no markdown and will be skipped` : 'Bulk enrichment skips the summary review modal and uses any cached summary silently.'}
+                        >
+                          {bulkOp?.type === 'enrich'
+                            ? `⏳ ${bulkOp.current}/${bulkOp.total}`
+                            : `✨ Enrich${enrichable > 0 ? ` (${enrichable})` : ''}`}
+                        </button>
+                      )
+                    })()}
                   </div>
                 )}
 
                 {bulkOp && (
                   <div className="bulk-progress">
                     <span className="bulk-progress-label">
-                      {bulkOp.type === 'convert' ? 'Converting' : 'Chunking'}{' '}
+                      {bulkOp.type === 'convert' ? 'Converting' :
+                        bulkOp.type === 'chunk' ? 'Chunking' : 'Enriching'}{' '}
                       {bulkOp.current}/{bulkOp.total}
                     </span>
                     {bulkOp.currentFile && (
@@ -284,6 +374,38 @@ export default function Sidebar({
                       )}
                       <span className="doc-icon">📄</span>
                       <span className="doc-name">{doc}</span>
+                      {docsWithFailures?.has(doc) && (
+                        <span
+                          className="doc-warning-badge"
+                          aria-label={WARNING_TOOLTIP_TEXT}
+                          tabIndex={0}
+                          onMouseEnter={showWarningTip}
+                          onMouseLeave={hideWarningTip}
+                          onFocus={showWarningTip}
+                          onBlur={hideWarningTip}
+                        >
+                          {/* Inline SVG warning triangle.  Renders identically
+                              across platforms (no Unicode/emoji font roulette),
+                              inherits the colour via ``currentColor``, and
+                              matches the stroke style used elsewhere in the
+                              app (see the password-toggle icons). */}
+                          <svg
+                            width="14"
+                            height="14"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2.5"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+                            <line x1="12" y1="9" x2="12" y2="13" />
+                            <line x1="12" y1="17" x2="12.01" y2="17" />
+                          </svg>
+                        </span>
+                      )}
                       {docsWithMarkdown?.has(doc) && (
                         <span className="doc-md-badge" title="Markdown available">MD</span>
                       )}
@@ -317,6 +439,17 @@ export default function Sidebar({
             {!collapsed && <span className="sidebar-settings-label">Settings</span>}
           </button>
         </div>
+      )}
+
+      {warningTip && createPortal(
+        <div
+          className="doc-warning-tooltip"
+          role="tooltip"
+          style={{ left: warningTip.x + 8, top: warningTip.y }}
+        >
+          {WARNING_TOOLTIP_TEXT}
+        </div>,
+        document.body,
       )}
     </div>
   )

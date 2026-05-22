@@ -4,16 +4,20 @@ import MarkdownViewer from './components/viewer/MarkdownViewer'
 import ChunkViewer from './components/viewer/ChunkViewer'
 import SettingsModal from './components/modals/SettingsModal'
 import ProgressModal from './components/modals/ProgressModal'
-import Toast from './components/viewer/Toast'
+import ConfirmDialog from './components/modals/ConfirmDialog'
+import Toast from './components/Toast'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { useDocument } from './hooks/useDocument'
 import { useChunks } from './hooks/useChunks'
 import { useBulkOps } from './hooks/useBulkOps'
 import { loadSplitPct, saveSplitPct } from './hooks/useSettings'
 import PDFViewer from './components/viewer/PDFViewer'
-import { converterFilenameToken, mdSourceFromFilename } from './services/apiService'
 import {
-  METADATA_FETCH_TIMEOUT_MS,
+  converterFilenameToken,
+  fetchDocumentMetadata,
+  mdSourceFromFilename,
+} from './services/apiService'
+import {
   TOAST_DURATION_ERROR_MS,
   TOAST_DURATION_SUCCESS_MS,
 } from './config'
@@ -64,6 +68,12 @@ export default function App() {
 
   // Set of PDF filenames that have a corresponding markdown file.
   const [docsWithMarkdown, setDocsWithMarkdown] = useState<Set<string>>(new Set())
+
+  // Set of PDF filenames whose last VLM run ended with at least one failed
+  // page (or was cancelled mid-flight). Source of truth on the backend is
+  // the presence of ``.checkpoints/{stem}_vlm/``. Used by the sidebar to
+  // show a warning icon so partial conversions are visible at a glance.
+  const [docsWithFailures, setDocsWithFailures] = useState<Set<string>>(new Set())
 
   // The active Markdown source token ("pymupdf4llm", "docling", "uploaded",
   // …) — used by the saved-chunks filter, the auto-link logic inside
@@ -243,23 +253,28 @@ export default function App() {
   // content changes, not when useDocument recreates the array with the same values.
   const documentsKey = useMemo(() => documents.join(','), [documents])
   useEffect(() => {
-    if (documentsKey === '') { setDocsWithMarkdown(new Set()); return }
-    fetch('/api/documents/metadata', { signal: AbortSignal.timeout(METADATA_FETCH_TIMEOUT_MS) })
-      .then(r => r.ok ? r.json() : [])
-      .then((meta: Array<{ filename: string; has_markdown: boolean }>) => {
-        setDocsWithMarkdown(new Set(meta.filter(m => m.has_markdown).map(m => m.filename)))
-      })
-      .catch((err: unknown) => {
-        const name = (err as { name?: string })?.name
-        if (name !== 'AbortError' && name !== 'TimeoutError') {
-          console.error('Failed to fetch document metadata:', err)
-        }
-      })
+    if (documentsKey === '') {
+      setDocsWithMarkdown(new Set())
+      setDocsWithFailures(new Set())
+      return
+    }
+    fetchDocumentMetadata('fetch document metadata').then(meta => {
+      setDocsWithMarkdown(new Set(meta.filter(m => m.has_markdown).map(m => m.filename)))
+      setDocsWithFailures(new Set(meta.filter(m => m.has_failures).map(m => m.filename)))
+    })
   }, [documentsKey])
 
   // Keep docsWithMarkdown in sync when a single-file conversion or deletion occurs.
   // Guard against documentData === null (loading state): we don't know yet whether
   // the doc has markdown, so don't prematurely remove it from the set.
+  //
+  // Intentionally NOT touching ``docsWithFailures`` here: that flag is a
+  // per-PDF property (does any variant or checkpoint on disk show failures?)
+  // and inferring it from ``documentData.md_content`` would flip the warning
+  // off whenever the user switched the version dropdown to a clean variant
+  // of a document that still has an unfinished VLM variant on disk.  The
+  // ``converting`` effect below refreshes the backend signal at the only
+  // moments when ``has_failures`` can actually change for the active doc.
   useEffect(() => {
     if (!selectedDoc || documentData === null) return
     setDocsWithMarkdown(prev => {
@@ -269,6 +284,40 @@ export default function App() {
       return next
     })
   }, [selectedDoc, documentData])
+
+  // Refresh metadata (notably ``has_failures``) whenever a single-file
+  // conversion finishes.  ``converting`` transitioning true → false is the
+  // only point in a single-doc flow at which the on-disk failure state can
+  // change.  Bulk convert refreshes via ``handleConvertSuccess``; uploads
+  // and deletes refresh via the documents-list effect above; variant
+  // switches don't touch on-disk state at all and so deliberately don't
+  // trigger this.
+  const prevConvertingRef = useRef(converting)
+  useEffect(() => {
+    if (prevConvertingRef.current && !converting) {
+      fetchDocumentMetadata('refresh document metadata after conversion').then(meta => {
+        setDocsWithMarkdown(new Set(meta.filter(m => m.has_markdown).map(m => m.filename)))
+        setDocsWithFailures(new Set(meta.filter(m => m.has_failures).map(m => m.filename)))
+      })
+    }
+    prevConvertingRef.current = converting
+  }, [converting])
+
+  // Re-uploading an existing file leaves the ``documents`` list unchanged,
+  // so the ``documentsKey``-driven metadata fetch above doesn't fire. Hook
+  // into the uploading false-edge instead so badges (and the selected doc,
+  // if it was overwritten) refresh after every upload.
+  const prevUploadingRef = useRef(uploading)
+  useEffect(() => {
+    if (prevUploadingRef.current && !uploading) {
+      fetchDocumentMetadata('refresh document metadata after upload').then(meta => {
+        setDocsWithMarkdown(new Set(meta.filter(m => m.has_markdown).map(m => m.filename)))
+        setDocsWithFailures(new Set(meta.filter(m => m.has_failures).map(m => m.filename)))
+      })
+      if (selectedDoc) refreshDocument()
+    }
+    prevUploadingRef.current = uploading
+  }, [uploading, selectedDoc, refreshDocument])
 
   // ── Persist split ratio ───────────────────────────────────────
   const splitPctRef = useRef(splitPct)
@@ -358,10 +407,9 @@ export default function App() {
   // viewer (and the chunking that's keyed off documentData.md_filename) on
   // A's content.
   const handleConvertSuccess = useCallback(async (succeededFiles: Set<string>) => {
-    const meta: Array<{ filename: string; has_markdown: boolean }> = await fetch('/api/documents/metadata', { signal: AbortSignal.timeout(METADATA_FETCH_TIMEOUT_MS) })
-      .then(r => r.ok ? r.json() : [])
-      .catch(() => [])
+    const meta = await fetchDocumentMetadata('refresh document metadata after bulk convert')
     setDocsWithMarkdown(new Set(meta.filter(m => m.has_markdown).map(m => m.filename)))
+    setDocsWithFailures(new Set(meta.filter(m => m.has_failures).map(m => m.filename)))
     if (selectedDoc && succeededFiles.has(selectedDoc)) {
       await refreshDocument()
       const token = converterFilenameToken(settings.converter)
@@ -372,7 +420,7 @@ export default function App() {
   }, [selectedDoc, refreshDocument, selectMarkdownVersion, settings.converter])
 
   const {
-    bulkOp, bulkConnectionLost, interruptBulk, handleBulkConvert, handleBulkChunk,
+    bulkOp, bulkConnectionLost, interruptBulk, handleBulkConvert, handleBulkChunk, handleBulkEnrich,
   } = useBulkOps({
     batchConvert,
     settings,
@@ -414,9 +462,15 @@ export default function App() {
         title="Switch between Markdown versions for this document"
       >
         {availableMarkdowns.map(v => {
-          const label = v.source === 'converted' && v.converter
+          const baseLabel = v.source === 'converted' && v.converter
             ? v.converter
             : `${v.filename} · uploaded`
+          // Append a ⚠ inline when this specific variant carries VLM
+          // failure placeholders — surfaced from the backend so the marker
+          // is consistent with the sidebar warning and the in-viewer
+          // banner.  ``<option>`` text only, no styling: <select> elements
+          // can't render rich content cross-browser.
+          const label = v.has_failures ? `${baseLabel} ⚠` : baseLabel
           return <option key={v.filename} value={v.filename}>{label}</option>
         })}
       </select>
@@ -522,11 +576,13 @@ export default function App() {
         onDeleteMarkdown={handleDeleteMarkdown}
         onConvert={handleConvert}
         converterLabel={converterLabel}
+        activeConverter={settings.converter}
         converting={converting}
         savingMd={savingMd}
         sectionEnrichment={settings.sectionEnrichment}
         onEnrichSuccess={toastCallbacks.onSuccess}
         onEnrichError={toastCallbacks.onError}
+        mdFilename={documentData.md_filename}
       />
     )
   }
@@ -576,38 +632,37 @@ export default function App() {
       )}
 
       {/* ── Unsaved chunks confirmation ── */}
-      {pendingChunkAction && (
-        <div className="confirm-switch-overlay" onClick={handleCancelDirty}>
-          <div className="confirm-switch-dialog" onClick={e => e.stopPropagation()}>
-            <p>
-              You have unsaved chunk changes. Save them before continuing?
-            </p>
-            <div className="confirm-switch-actions">
-              <button className="btn-secondary" onClick={handleCancelDirty}>Cancel</button>
-              <button className="btn-secondary" onClick={handleDiscardDirty}>Discard</button>
-              <button className="btn-primary" onClick={handleSaveDirty} disabled={savingChunks}>
-                {savingChunks ? 'Saving…' : 'Save'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        isOpen={!!pendingChunkAction}
+        onDismiss={handleCancelDirty}
+        actions={[
+          { label: 'Cancel', onClick: handleCancelDirty },
+          { label: 'Discard', onClick: handleDiscardDirty },
+          {
+            label: savingChunks ? 'Saving…' : 'Save',
+            onClick: handleSaveDirty,
+            variant: 'primary',
+            disabled: savingChunks,
+          },
+        ]}
+      >
+        <p>You have unsaved chunk changes. Save them before continuing?</p>
+      </ConfirmDialog>
 
       {/* ── Confirm switch while processing ── */}
-      {pendingDoc && (
-        <div className="confirm-switch-overlay" onClick={cancelSwitch}>
-          <div className="confirm-switch-dialog" onClick={e => e.stopPropagation()}>
-            <p>
-              A {converting || convertingToPdf ? 'conversion' : 'chunking'} is in progress.
-              Switching documents will cancel it. Continue?
-            </p>
-            <div className="confirm-switch-actions">
-              <button className="btn-secondary" onClick={cancelSwitch}>Stay</button>
-              <button className="btn-danger" onClick={confirmSwitch}>Switch document</button>
-            </div>
-          </div>
-        </div>
-      )}
+      <ConfirmDialog
+        isOpen={!!pendingDoc}
+        onDismiss={cancelSwitch}
+        actions={[
+          { label: 'Stay', onClick: cancelSwitch },
+          { label: 'Switch document', onClick: confirmSwitch, variant: 'danger' },
+        ]}
+      >
+        <p>
+          A {converting || convertingToPdf ? 'conversion' : 'chunking'} is in progress.
+          Switching documents will cancel it. Continue?
+        </p>
+      </ConfirmDialog>
 
       <Sidebar
         documents={documents}
@@ -620,8 +675,10 @@ export default function App() {
         onDelete={deleteDocuments}
         onBulkConvert={handleBulkConvert}
         onBulkChunk={handleBulkChunk}
+        onBulkEnrich={handleBulkEnrich}
         onOpenSettings={() => setSettingsOpen(true)}
         docsWithMarkdown={docsWithMarkdown}
+        docsWithFailures={docsWithFailures}
       />
 
       <div className="main-content">
@@ -745,6 +802,7 @@ export default function App() {
                       chunking={chunking}
                       savingChunks={savingChunks}
                       chunkEnrichment={settings.chunkEnrichment}
+                      mdFilename={documentData.md_filename}
                       onEnrichChunk={enrichChunk}
                       onChunkEdit={editChunk}
                       onDeleteChunk={deleteChunk}

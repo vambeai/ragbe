@@ -11,6 +11,13 @@ interface Options {
   chunks: Chunk[] | null
   /** Watched to clear in-progress state when the document changes. */
   content: string
+  /**
+   * Active markdown variant filename, e.g. ``"report_vlm.md"``.  When
+   * provided, the chunk-enrichment endpoint attaches the per-PDF cached
+   * summary to every chunk prompt as document-level context (Phase B).
+   * No effect when undefined or when no summary is cached for the PDF.
+   */
+  mdFilename?: string
   selectedChunks: Set<number>
   onEnrichChunk: (index: number, updates: Partial<Chunk>) => void
   setEnrichError: (msg: string | null) => void
@@ -36,6 +43,7 @@ export function useChunkEnrichment({
   chunkEnrichment,
   chunks,
   content,
+  mdFilename,
   selectedChunks,
   onEnrichChunk,
   setEnrichError,
@@ -77,8 +85,20 @@ export function useChunkEnrichment({
   // We don't clear on every chunks update so that concurrent single-chunk
   // enrichments don't lose their loading indicators each time one of them
   // writes its result back into the array.
+  //
+  // We also abort any in-flight enrichment requests.  Without this, a doc
+  // switch (or rechunk) made while a single-chunk enrichment is in flight
+  // would let the late response land via ``onEnrichChunk(index, …)`` AFTER
+  // the new doc's chunks populated — silently writing the old doc's
+  // enrichment into the new doc's chunk at the same index.  Bulk and
+  // pipeline enrichments are gated by a full-viewport ProgressModal so the
+  // user can't trigger a doc switch during them, but single-chunk enrich
+  // leaves the sidebar reachable; this effect is the only thing that
+  // guarantees those requests don't outlive their owning document.
   useEffect(() => {
     if (chunks === null) {
+      singleEnrichAbortRef.current?.abort()
+      bulkEnrichAbortRef.current?.abort()
       setEnrichingChunks(new Set())
       setChunkEnrichErrors(new Map())
     }
@@ -122,6 +142,7 @@ export function useChunkEnrichment({
         (chunk.metadata ?? {}) as Record<string, unknown>,
         abortCtrl.signal,
         () => setChunkEnrichErrors(prev => new Map(prev).set(chunkIndex, CONNECTION_LOST_MSG)),
+        mdFilename,
       )
       onEnrichChunk(chunkIndex, {
         cleaned_chunk: (result.cleaned_chunk as string) ?? chunk.cleaned_chunk,
@@ -189,7 +210,10 @@ export function useChunkEnrichment({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: abortCtrl.signal,
-        body: JSON.stringify(buildEnrichmentBody(chunkEnrichment, { chunks: chunksToEnrich })),
+        body: JSON.stringify(buildEnrichmentBody(chunkEnrichment, {
+          chunks: chunksToEnrich,
+          ...(mdFilename ? { md_filename: mdFilename } : {}),
+        })),
       })
       if (!res.ok) {
         const errText = await res.text().catch(() => res.statusText)

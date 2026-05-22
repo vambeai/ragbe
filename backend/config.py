@@ -111,6 +111,14 @@ class Settings(BaseSettings):
     VLM_WRITE_TIMEOUT_S: float = 10.0
     """Seconds allowed for sending the PDF page image to the VLM endpoint."""
 
+    VLM_CHECKPOINT_ENABLED: bool = True
+    """When true, successful VLM page transcriptions are persisted to
+    ``{MDS_DIR}/.checkpoints/{stem}_vlm/`` as they complete, and an
+    interrupted job resumes from the last cached page on the next run.
+    Set to false to disable checkpointing globally (e.g. for ephemeral
+    benchmarks). Users can also opt out per-conversion via the
+    ``use_checkpoint`` field on the convert request."""
+
     # ── Cloud converter ────────────────────────────────
     CLOUD_DEFAULT_BASE_URL: str = "http://localhost:8080/convert"
     """Default endpoint for the Cloud PDF→Markdown converter."""
@@ -175,7 +183,7 @@ class Settings(BaseSettings):
     omits the field."""
 
     # ── App ────────────────────────────────────────────────────
-    APP_VERSION: str = "0.4.0"
+    APP_VERSION: str = "0.5.0"
 
 
 @lru_cache

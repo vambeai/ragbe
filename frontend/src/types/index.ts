@@ -39,6 +39,21 @@ export interface VLMSettings {
   api_key?: string
   temperature?: number
   user_prompt?: string
+  /**
+   * When true (default), an interrupted VLM conversion resumes from the
+   * per-page checkpoint saved by the previous run.  When false, any
+   * existing checkpoint is discarded and the document is reconverted
+   * from page 1.
+   */
+  use_checkpoint?: boolean
+}
+
+export interface CheckpointInfo {
+  document_name: string
+  converter: string
+  exists: boolean
+  /** 1-indexed page numbers already cached on disk. */
+  completed_pages: number[]
 }
 
 export interface CloudSettings {
@@ -52,6 +67,56 @@ export interface EnrichmentSettings {
   api_key?: string
   temperature?: number
   user_prompt?: string
+  /**
+   * Pipeline enrichment: when true (default), per-piece corrections from a
+   * previous run are reused on re-run if every input (piece content +
+   * prompt + model + temperature + document summary) is unchanged.  When
+   * false, the cache is discarded and every piece is reconverted from
+   * scratch.  Only the markdown enrichment pipeline reads this flag;
+   * chunk enrichment ignores it.
+   */
+  use_checkpoint?: boolean
+  /**
+   * Pipeline enrichment: when true, the SummaryReviewModal is bypassed
+   * entirely on Enrich click and the pipeline runs WITHOUT a document
+   * summary (cleanup + per-piece corrections only, no document-level
+   * context block in the piece prompts).  Use to skip the ~30s
+   * summary build on long PDFs when you only want OCR / sentence-join
+   * fixes.  Defaults to false (show the review modal).
+   */
+  skip_summary?: boolean
+}
+
+
+// ---------------------------------------------------------------------------
+// Document-level summary
+//
+// One record per source PDF, reused across every converter variant.  The
+// frontend's Summary Review modal lets the user inspect / edit /
+// regenerate the record before any enrichment pipeline runs against it.
+// ---------------------------------------------------------------------------
+
+export interface DocumentSummary {
+  topic: string
+  narrative: string
+}
+
+export interface DocumentSummaryStatus {
+  /**
+   * True when the most recent persistence happened via the PUT endpoint
+   * (i.e. the user edited the summary in the review modal).  Protects
+   * the content against silent overwrites by future pipeline runs —
+   * only an explicit Regenerate or PDF re-upload replaces it.
+   */
+  user_edited: boolean
+  generated_at: string
+}
+
+export interface DocumentSummaryResponse {
+  filename: string
+  doc_stem: string
+  summary: DocumentSummary
+  status: DocumentSummaryStatus
 }
 
 // ---------------------------------------------------------------------------
@@ -84,6 +149,10 @@ export interface MarkdownVersion {
   source: 'converted' | 'uploaded'
   converter: string | null
   file_path: string
+  /** True iff this variant contains VLM ``<!-- page N failed: … -->``
+   *  placeholders left by a partial conversion.  Drives the ⚠ marker
+   *  next to the variant's entry in the version picker. */
+  has_failures?: boolean
 }
 
 export interface ChunksVersion {

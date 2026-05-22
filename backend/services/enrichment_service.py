@@ -12,11 +12,14 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
 
 from backend.utils.retry import async_retry_with_backoff
+
+if TYPE_CHECKING:
+    from .document_summary import DocumentSummary, PieceExtraction
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +119,133 @@ def _extract_fields_regex(raw: str, original_content: str) -> dict | None:
 # Prompts
 # ---------------------------------------------------------------------------
 
-_MARKDOWN_SYSTEM = (
-    "You are a markdown document quality specialist. Your task is to improve "
-    "markdown documents that were converted from PDFs. Correct conversion "
-    "artifacts, fix broken formatting, remove duplicate or garbled content, "
-    "and improve readability while strictly preserving all original information. "
-    "Return ONLY the corrected markdown — no commentary, no code fences."
+# ---------------------------------------------------------------------------
+# Conservative prompts for the per-piece pipeline
+# ---------------------------------------------------------------------------
+# Used by ``enrich_piece`` (called from the pipeline orchestrator).  The
+# language is deliberately heavy-handed about NOT rewriting: the cleanup
+# regex stage upstream has already fixed the easy artifacts, so anything
+# remaining is either a hard problem (OCR, fragmented sentences) or
+# already-correct prose the LLM should leave alone.  Over-correction is
+# the bigger risk than under-correction at this point in the pipeline.
+#
+# Two variants because the user message can arrive with or without a
+# ``<<<DOCUMENT SUMMARY>>>`` block:
+#
+#   ``_PIECE_SYSTEM``               — no summary attached; the prompt
+#                                     never references one (mentioning a
+#                                     non-existent block tends to make
+#                                     the model invent context).
+#   ``_PIECE_SYSTEM_WITH_SUMMARY``  — same conservative repair rules plus
+#                                     a clause telling the model how to
+#                                     use the DOCUMENT SUMMARY block.
+#
+# Both versions feed the per-piece cache key, so a run that toggles
+# ``use_summary`` cleanly invalidates the old cache (the prompts
+# differ).
+_PIECE_SYSTEM_BASE = (
+    "You repair markdown that was converted from a PDF. You are conservative: "
+    "if the text already reads cleanly, return it byte-for-byte unchanged. "
+    "Only fix obvious conversion artifacts:\n"
+    "  - OCR errors that produce nonsensical character sequences\n"
+    "  - Sentences fragmented across line breaks mid-word or mid-clause\n"
+    "  - Misordered fragments from multi-column layout\n"
+    "  - Broken markdown syntax (unclosed tables, malformed lists)\n"
+    "\nNEVER:\n"
+    "  - Rephrase, summarise, or expand correct content\n"
+    "  - Fix grammar, style, or capitalization choices in the source\n"
+    "  - Add information not present in the source\n"
+    "  - Remove information present in the source (including unusual "
+    "formatting, dates, numbers, names)\n"
+    "  - Change heading levels, code blocks, or table structure\n"
+    "  - Translate or modernise the language\n"
+    "\nIf unsure whether something is an error or intentional, LEAVE IT "
+    "UNCHANGED. Under-correction is preferred over over-correction.\n"
 )
+
+_PIECE_SYSTEM_OUTPUT_FOOTER = (
+    "\nReturn ONLY the corrected markdown of the SECTION provided. Do not "
+    "include the preceding context in your output. No commentary. No code "
+    "fences around the result."
+)
+
+_PIECE_SYSTEM_SUMMARY_CLAUSE = (
+    "\nYou may use the DOCUMENT SUMMARY block to disambiguate terms or "
+    "proper nouns, but NEVER use it to add information that is not "
+    "already present in the SECTION.\n"
+)
+
+_PIECE_SYSTEM = _PIECE_SYSTEM_BASE + _PIECE_SYSTEM_OUTPUT_FOOTER
+_PIECE_SYSTEM_WITH_SUMMARY = (
+    _PIECE_SYSTEM_BASE + _PIECE_SYSTEM_SUMMARY_CLAUSE + _PIECE_SYSTEM_OUTPUT_FOOTER
+)
+
+
+# ---------------------------------------------------------------------------
+# Document-summary prompts (used by the map-reduce summary builder)
+# ---------------------------------------------------------------------------
+
+_PIECE_EXTRACT_SYSTEM = (
+    "You extract a compact reference for a section of a longer document. "
+    "Return ONLY valid JSON with EXACTLY these two fields:\n"
+    '  "topic_hints":  array of short phrases describing what this section is about\n'
+    '  "narrative":    one-sentence summary of what this section covers\n'
+    "\nReturn an empty array / empty string when a field has nothing to "
+    "report — never invent content.  No commentary.  No code fences."
+)
+
+_REDUCE_SYSTEM = (
+    "You synthesise a document-level summary from per-section extractions. "
+    "Return ONLY valid JSON with EXACTLY these two fields:\n"
+    '  "topic":      one short phrase capturing what the whole document is about\n'
+    '  "narrative":  a single coherent paragraph (~200 words) summarising the '
+    "document in source order.  Give equal weight to early and late sections — "
+    "do not over-index on the final pieces.  No commentary.  No code fences."
+)
+
+
+# Boundary-whitespace matchers used by ``enrich_piece`` to keep piece joins
+# byte-identical to the source.  Compiled once at import time.
+_LEADING_WS_RE = re.compile(r"^\s*")
+_TRAILING_WS_RE = re.compile(r"\s*$")
+
+
+def _build_piece_user_message(
+    piece_content: str,
+    previous_context: str,
+    document_summary_block: str = "",
+) -> str:
+    """Construct the user message for ``enrich_piece``.
+
+    The previous-context block is rendered as a fenced quote so the model
+    sees an unambiguous boundary between "context (read but don't return)"
+    and "section to correct".  When there is no previous context (first
+    piece), the context block is omitted entirely.
+
+    When ``document_summary_block`` is non-empty it is prepended in its
+    own fenced section so the model can use the document-level context to
+    disambiguate terms and proper nouns without confusing it for content
+    to repeat.
+    """
+    parts: list[str] = []
+    if document_summary_block:
+        parts.append(
+            "<<<DOCUMENT SUMMARY — for context only, do not include in your output>>>\n"
+            f"{document_summary_block}\n"
+            "<<<END DOCUMENT SUMMARY>>>"
+        )
+    if previous_context:
+        parts.append(
+            "<<<PREVIOUS CONTEXT — for reference only, do not include in your output>>>\n"
+            f"{previous_context}\n"
+            "<<<END PREVIOUS CONTEXT>>>"
+        )
+    parts.append(
+        "<<<SECTION TO CORRECT>>>\n"
+        f"{piece_content}\n"
+        "<<<END SECTION TO CORRECT>>>"
+    )
+    return "\n\n".join(parts)
 
 _CHUNK_SYSTEM = (
     "You are a document analysis specialist. Analyze the provided text chunk "
@@ -134,6 +257,20 @@ _CHUNK_SYSTEM = (
     '"keywords" (array of keyword strings), '
     '"questions" (array of questions this chunk could answer). '
     "Return ONLY valid JSON — no commentary, no code fences."
+)
+
+# Same task and JSON shape as ``_CHUNK_SYSTEM``, but with one extra
+# clause explaining how to consume the ``<<<DOCUMENT SUMMARY>>>`` block
+# the user message will prepend.  Used only when the chunks router was
+# able to load a cached summary; falls back to the bare prompt
+# otherwise so we don't dangle a reference to a block that isn't there.
+_CHUNK_SYSTEM_WITH_SUMMARY = (
+    _CHUNK_SYSTEM
+    + "\n\nThe user message begins with a <<<DOCUMENT SUMMARY>>> block "
+    "describing what the document as a whole is about (topic, key "
+    "entities, key terms, structure).  Use it to disambiguate proper "
+    "nouns and to write a more accurate ``context`` field — but never "
+    "use it to invent information that is not present in the chunk."
 )
 
 
@@ -194,6 +331,57 @@ class EnrichmentService:
         self._client = AsyncOpenAI(**client_kwargs)
 
     # ------------------------------------------------------------------
+    # Public accessors (used by the pipeline orchestrator for cache keys)
+    # ------------------------------------------------------------------
+
+    @property
+    def model_name(self) -> str:
+        """The OpenAI-compatible model identifier this service calls."""
+        return self._model
+
+    @property
+    def user_prompt(self) -> str | None:
+        """The user-supplied override for the built-in system prompt, if any."""
+        return self._user_prompt
+
+    @property
+    def temperature(self) -> float:
+        """The sampling temperature used for every LLM call."""
+        return self._temperature
+
+    def effective_chunk_system_prompt(self, *, with_summary: bool) -> str:
+        """Return the system prompt that ``enrich_chunk`` will use for
+        the given ``with_summary`` flag.  Same precedence rules as the
+        piece-level helper: a user-supplied override wins; otherwise
+        we pick between the bare and summary-aware default prompts.
+        """
+        if self._user_prompt:
+            return self._user_prompt
+        return _CHUNK_SYSTEM_WITH_SUMMARY if with_summary else _CHUNK_SYSTEM
+
+    def effective_piece_system_prompt(self, *, with_summary: bool) -> str:
+        """Return the system prompt that ``enrich_piece`` will actually
+        send for the given ``with_summary`` flag.
+
+        Surfaced as a method (rather than computed inline) so the
+        pipeline can mix the very same string into the per-piece cache
+        key — guaranteeing that toggling ``use_summary`` produces a
+        different hash and therefore a clean cache miss rather than a
+        stale reuse.
+
+        Precedence:
+            1. A user-supplied override (Settings → user_prompt) wins
+               unconditionally.  The override is the user's
+               responsibility; we do not splice the summary clause into
+               it because we cannot know whether they want it.
+            2. Otherwise return ``_PIECE_SYSTEM_WITH_SUMMARY`` when a
+               summary is attached, ``_PIECE_SYSTEM`` when not.
+        """
+        if self._user_prompt:
+            return self._user_prompt
+        return _PIECE_SYSTEM_WITH_SUMMARY if with_summary else _PIECE_SYSTEM
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -217,46 +405,289 @@ class EnrichmentService:
             operation="LLM call",
         )
 
-    async def _complete(self, messages: list) -> Any:
-        """Call chat.completions.create with retry, returning the raw response."""
+    async def _complete(self, messages: list, *, temperature: float | None = None) -> Any:
+        """Call chat.completions.create with retry, returning the raw response.
+
+        ``temperature`` overrides the instance default for this single call.
+        Used by the summary methods to pin temperature to a lower value
+        than the user-configured correction temperature, since reference
+        summaries benefit from less stochastic output.
+        """
+        effective_temp = self._temperature if temperature is None else temperature
         def _factory():
             return self._client.chat.completions.create(
                 model=self._model,
-                temperature=self._temperature,
+                temperature=effective_temp,
                 messages=messages,
             )
         return await self._call_with_retry(_factory)
+
+    @property
+    def _summary_temperature(self) -> float:
+        """Temperature used for summary extraction and reduce calls.
+
+        Caps the user-configured value at 0.2 so summaries stay roughly
+        deterministic regardless of how creative the user wants the
+        per-piece corrections to be.
+        """
+        return min(self._temperature, 0.2)
+
+    @staticmethod
+    def _parse_strict_json(raw: str) -> dict | None:
+        """Best-effort JSON parse with the same recovery ladder used by
+        ``enrich_chunk``.  Returns ``None`` when nothing salvageable was
+        found — caller falls back to its own degraded path.
+        """
+        cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+        repaired = _repair_truncated_json(cleaned)
+        if repaired is not None:
+            return repaired
+        return None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def enrich_markdown(self, content: str) -> str:
-        """Send markdown content to the LLM for cleanup and improvement.
+    async def enrich_piece(
+        self,
+        piece_content: str,
+        previous_context: str = "",
+        document_summary: "DocumentSummary | None" = None,
+    ) -> str:
+        """Correct a single pipeline-produced markdown piece.
+
+        Used by the pipeline orchestrator (``enrichment_pipeline``).  The
+        prompt enforces conservative behaviour — the model is told
+        explicitly to return content byte-for-byte unchanged when it has
+        no improvement to make.  Previous-piece context is sent as a
+        reference but the model is instructed not to repeat it in the
+        output.
 
         Args:
-            content: Raw markdown text.
+            piece_content:     The markdown segment to correct.
+            previous_context:  Tail of the *original* preceding piece(s),
+                               used to give the model situational
+                               awareness.  Pass an empty string for the
+                               first piece in a document.
+            document_summary:  Optional pre-computed document-level summary
+                               (see :mod:`document_summary`).  When
+                               provided, its prompt block is prepended to
+                               the user message so the model has access to
+                               topic, key terms, and entities while
+                               correcting the piece.  Has no effect when
+                               ``None`` or empty.
 
         Returns:
-            Enriched markdown string.
+            The corrected markdown for *this* piece only — never includes
+            the previous-context preamble.  Code-fence wrappers some
+            models add ("```markdown ... ```") are stripped before return.
         """
-        system_content = self._user_prompt if self._user_prompt else _MARKDOWN_SYSTEM
+        # Whitespace-only input has nothing to correct.  Return it as-is
+        # so callers outside the pipeline get the same fast-path behaviour
+        # the pipeline applies before reaching this method.  Crucially
+        # this also dodges the boundary-whitespace re-anchoring below,
+        # which doubles content when leading and trailing matches both
+        # cover the entire string.
+        if not piece_content.strip():
+            return piece_content
+
+        # Honour a user-supplied prompt override, mirroring enrich_chunk.
+        # The cache key in the pipeline hashes whichever system prompt is
+        # actually sent, so changing this string from settings invalidates
+        # the cache cleanly.
+        #
+        # When the user has supplied a custom system prompt we DO NOT
+        # inject the document-summary block into the user message: the
+        # user has taken responsibility for the prompt contract and may
+        # not have prepared their prompt to handle a wrapped
+        # ``<<<DOCUMENT SUMMARY>>> … <<<SECTION TO CORRECT>>>``
+        # structure.  Silently changing the user-message shape under
+        # them tends to make their custom prompt produce worse output
+        # than the unwrapped contract they tested against.  The default
+        # ``_PIECE_SYSTEM_WITH_SUMMARY`` path remains unaffected.
+        summary_block = (
+            document_summary.to_prompt_block()
+            if document_summary is not None
+                and not document_summary.is_empty()
+                and not self._user_prompt
+            else ""
+        )
+        system_content = self.effective_piece_system_prompt(with_summary=bool(summary_block))
+        user_message = _build_piece_user_message(
+            piece_content, previous_context, summary_block,
+        )
         response = await self._complete([
             {"role": "system", "content": system_content},
-            {"role": "user", "content": content},
+            {"role": "user", "content": user_message},
         ])
         if not response.choices:
             raise ValueError("LLM returned an empty choices list — no content to extract")
-        result = (response.choices[0].message.content or "").strip()
-        result = re.sub(r"^```(?:markdown)?\n?", "", result)
-        result = re.sub(r"\n?```$", "", result)
-        return result.strip()
 
-    async def enrich_chunk(self, content: str) -> dict[str, Any]:
+        result = response.choices[0].message.content or ""
+        # Strip code-fence wrappers that some models add around the body.
+        result = re.sub(r"^\s*```(?:markdown)?\n?", "", result)
+        result = re.sub(r"\n?```\s*$", "", result)
+        # Empty / whitespace-only model output would, after re-anchoring,
+        # collapse the piece to just its boundary whitespace and silently
+        # wipe its body.  Treat this as "no correction" and return the
+        # original piece verbatim — same fall-back behaviour as a piece
+        # the pipeline never sent to the LLM.
+        if not result.strip():
+            return piece_content
+        # Re-anchor the boundary whitespace.  The structure-aware splitter
+        # produced pieces that join byte-for-byte into the original source
+        # — every piece's trailing whitespace is exactly what separates
+        # it from the next piece (typically ``\n`` or ``\n\n``).  Most
+        # models confidently strip leading/trailing whitespace from their
+        # output, which would silently glue piece N's last line onto
+        # piece N+1's first line in the reassembled document (e.g. a
+        # heading concatenated onto the previous paragraph).  Restoring
+        # the original piece's leading and trailing whitespace keeps the
+        # join invariant intact regardless of what the model returns.
+        leading = _LEADING_WS_RE.match(piece_content)
+        trailing = _TRAILING_WS_RE.search(piece_content)
+        return (
+            (leading.group(0) if leading else "")
+            + result.strip()
+            + (trailing.group(0) if trailing else "")
+        )
+
+    async def extract_piece_summary(self, piece_content: str) -> "PieceExtraction":
+        """Map step of the document-summary pipeline.
+
+        Asks the model for structured reference information about a
+        single piece.  Output is parsed defensively — a malformed or
+        truncated response degrades to an empty extraction rather than
+        raising, so one bad piece never aborts the whole map step.
+        """
+        from .document_summary import PieceExtraction  # local import: avoid cycles
+
+        if not piece_content.strip():
+            return PieceExtraction()
+
+        user_message = (
+            "<<<SECTION TO ANALYSE>>>\n"
+            f"{piece_content}\n"
+            "<<<END SECTION TO ANALYSE>>>\n\n"
+            "Return ONE JSON object with EXACTLY the fields topic_hints "
+            "and narrative.  Do not describe the section.  No commentary, "
+            "preamble, or code fences.  Output JSON only."
+        )
+        response = await self._complete(
+            [
+                {"role": "system", "content": _PIECE_EXTRACT_SYSTEM},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=self._summary_temperature,
+        )
+        if not response.choices:
+            raise ValueError("LLM returned an empty choices list — no extraction to parse")
+
+        raw = response.choices[0].message.content or ""
+        parsed = self._parse_strict_json(raw)
+        if parsed is None:
+            logger.warning(
+                "extract_piece_summary: unparseable JSON, returning empty extraction. Raw: %.200s",
+                raw,
+            )
+            return PieceExtraction()
+        hints_raw = parsed.get("topic_hints", [])
+        topic_hints = (
+            [str(v).strip() for v in hints_raw if isinstance(v, (str, int, float)) and str(v).strip()]
+            if isinstance(hints_raw, list) else []
+        )
+        return PieceExtraction(
+            topic_hints=topic_hints,
+            narrative=str(parsed.get("narrative", "")).strip(),
+        )
+
+    async def reduce_extractions(
+        self,
+        *,
+        topic_hints: list[str],
+        narratives: list[str],
+    ) -> dict[str, str]:
+        """Reduce step of the document-summary pipeline.
+
+        Given the unioned per-piece topic hints and per-piece narratives
+        (in source order), asks the model to pick a final ``topic`` and
+        synthesise a single ~200-word ``narrative``.
+
+        Returns a dict with exactly ``topic`` and ``narrative`` string
+        fields (possibly empty on parse failure).
+        """
+        def _list_block(label: str, values: list[str], limit: int = 60) -> str:
+            if not values:
+                return ""
+            shown = values[:limit]
+            line = f"{label}: " + ", ".join(shown)
+            if len(values) > limit:
+                line += f" (+ {len(values) - limit} more)"
+            return line
+
+        narrative_block = ""
+        if narratives:
+            joined = "\n".join(f"- {n}" for n in narratives)
+            narrative_block = f"PER-SECTION NARRATIVES (in source order):\n{joined}"
+
+        sections = [
+            _list_block("TOPIC HINTS", topic_hints, limit=30),
+            narrative_block,
+        ]
+        user_message = "\n\n".join(s for s in sections if s)
+        if not user_message:
+            return {"topic": "", "narrative": ""}
+
+        user_message += (
+            "\n\nReturn ONE JSON object with EXACTLY the fields topic and "
+            "narrative.  No commentary, no code fences.  Output JSON only."
+        )
+
+        response = await self._complete(
+            [
+                {"role": "system", "content": _REDUCE_SYSTEM},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=self._summary_temperature,
+        )
+        if not response.choices:
+            raise ValueError("LLM returned an empty choices list — no reduce result to parse")
+
+        raw = response.choices[0].message.content or ""
+        parsed = self._parse_strict_json(raw)
+        if parsed is None:
+            logger.warning(
+                "reduce_extractions: unparseable JSON, returning empty reduce. Raw: %.200s",
+                raw,
+            )
+            return {"topic": "", "narrative": ""}
+        return {
+            "topic": str(parsed.get("topic", "")).strip(),
+            "narrative": str(parsed.get("narrative", "")).strip(),
+        }
+
+    async def enrich_chunk(
+        self,
+        content: str,
+        document_summary: "DocumentSummary | None" = None,
+    ) -> dict[str, Any]:
         """Enrich a single chunk and return a dict of enriched fields.
 
         Args:
-            content: Raw chunk text.
+            content:           Raw chunk text.
+            document_summary:  Optional pre-built document-level summary
+                               (see :mod:`document_summary`).  When
+                               provided and non-empty, its prompt block
+                               is prepended to the user message so the
+                               model can write a more accurate
+                               ``context`` field and disambiguate proper
+                               nouns.  Has no effect when ``None`` or
+                               empty.
 
         Returns:
             Dict with keys: cleaned_chunk, title, context, summary,
@@ -267,10 +698,34 @@ class EnrichmentService:
             and all enrichment fields are returned as empty defaults rather
             than raising, so the chunk is never silently dropped from the batch.
         """
-        system_content = self._user_prompt if self._user_prompt else _CHUNK_SYSTEM
+        # See the matching comment in ``enrich_piece`` — when the user
+        # has supplied a custom system prompt we do not auto-wrap the
+        # user message in summary markers.  The custom prompt was
+        # written against the raw-chunk contract; silently changing it
+        # to wrap the chunk in ``<<<CHUNK TO ANALYSE>>>`` boundaries
+        # makes the model's JSON output less reliable for that prompt.
+        summary_block = (
+            document_summary.to_prompt_block()
+            if document_summary is not None
+                and not document_summary.is_empty()
+                and not self._user_prompt
+            else ""
+        )
+        system_content = self.effective_chunk_system_prompt(with_summary=bool(summary_block))
+        if summary_block:
+            user_content = (
+                "<<<DOCUMENT SUMMARY — for context only, do not include in your output>>>\n"
+                f"{summary_block}\n"
+                "<<<END DOCUMENT SUMMARY>>>\n\n"
+                "<<<CHUNK TO ANALYSE>>>\n"
+                f"{content}\n"
+                "<<<END CHUNK TO ANALYSE>>>"
+            )
+        else:
+            user_content = content
         response = await self._complete([
             {"role": "system", "content": system_content},
-            {"role": "user", "content": content},
+            {"role": "user", "content": user_content},
         ])
         if not response.choices:
             raise ValueError("LLM returned an empty choices list — no content to extract")

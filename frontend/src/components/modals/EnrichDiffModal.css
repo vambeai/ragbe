@@ -1,0 +1,327 @@
+/* Enrichment diff preview modal — shown after the pipeline finishes,
+   before the enriched content is written to disk.  Two tabs:
+
+     * Side-by-side diff (read-only, colored)
+     * Edit (read-only original on the left, free-form textarea on the right)
+
+   The user can edit the enriched output in the Edit tab and click Accept
+   to write THAT content to disk (not the raw pipeline output).
+*/
+
+.enrich-diff-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(20, 8, 2, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.enrich-diff-modal {
+  background: #FBF6EE;
+  border: 1.5px solid rgba(139, 69, 19, 0.18);
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(20, 8, 2, 0.30);
+  width: min(1600px, 100%);
+  height: min(900px, 100%);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.enrich-diff-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1.5px solid rgba(139, 69, 19, 0.12);
+  flex-shrink: 0;
+}
+
+.enrich-diff-title {
+  margin: 0;
+  font-size: 16px;
+  color: #3D2A18;
+  font-weight: 700;
+}
+
+.enrich-diff-stats {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #6A5238;
+}
+
+.enrich-diff-stats strong {
+  color: #3D2A18;
+}
+
+.enrich-diff-stats .enrich-diff-failed {
+  color: #A85F00;
+}
+
+.enrich-diff-close {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 8px;
+  color: #6A5238;
+}
+
+.enrich-diff-close:hover {
+  color: #3D2A18;
+}
+
+/* Tabs */
+
+.enrich-diff-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 20px 0;
+  border-bottom: 1.5px solid rgba(139, 69, 19, 0.12);
+  flex-shrink: 0;
+}
+
+.enrich-diff-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2.5px solid transparent;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #6A5238;
+  cursor: pointer;
+  margin-bottom: -1.5px;
+}
+
+.enrich-diff-tab.active {
+  color: #3D2A18;
+  border-bottom-color: #8B4513;
+}
+
+.enrich-diff-tab:hover:not(.active) {
+  color: #3D2A18;
+}
+
+/* ── Body ── */
+
+.enrich-diff-body {
+  flex: 1;
+  overflow: auto;
+  background: #FFFBF4;
+}
+
+.enrich-diff-notice {
+  padding: 24px;
+  text-align: center;
+  color: #6A5238;
+  font-size: 13px;
+}
+
+/* ── Side-by-side diff grid ── */
+
+.enrich-diff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #3D2A18;
+}
+
+.enrich-diff-col-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: #FBF6EE;
+  border-bottom: 1.5px solid rgba(139, 69, 19, 0.18);
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #6A5238;
+}
+
+.enrich-diff-col-header + .enrich-diff-col-header {
+  border-left: 1px solid rgba(139, 69, 19, 0.18);
+}
+
+/* One cell per side per row.  Each cell is a single line and pairs with
+   the cell in the opposite column at the same grid row. */
+.enrich-diff-cell {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  padding: 0 8px 0 0;
+  min-height: 1.55em;       /* keep blank-line cells visible */
+  border-bottom: 1px solid rgba(139, 69, 19, 0.06);
+  background: transparent;
+}
+
+.enrich-diff-cell + .enrich-diff-cell {
+  border-left: 1px solid rgba(139, 69, 19, 0.10);
+}
+
+.enrich-diff-cell.empty {
+  background: rgba(139, 69, 19, 0.04);
+  background-image: repeating-linear-gradient(
+    -45deg,
+    transparent,
+    transparent 6px,
+    rgba(139, 69, 19, 0.05) 6px,
+    rgba(139, 69, 19, 0.05) 12px
+  );
+}
+
+/* Diff colors —
+     changed-left  = deleted-from-original (or "old" side of a modify)
+     changed-right = inserted (or "new" side of a modify) */
+.enrich-diff-cell.changed-left {
+  background: rgba(180, 50, 30, 0.10);
+}
+
+.enrich-diff-cell.changed-right {
+  background: rgba(60, 140, 60, 0.13);
+}
+
+.enrich-diff-line-num {
+  color: #B8A989;
+  font-size: 10px;
+  text-align: right;
+  padding-right: 8px;
+  user-select: none;
+  -webkit-user-select: none;
+  align-self: start;
+  padding-top: 1px;
+}
+
+.enrich-diff-line-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.enrich-diff-skip-row {
+  padding: 6px 16px;
+  font-style: italic;
+  color: #B8A989;
+  background: rgba(139, 69, 19, 0.04);
+  border-top: 1px dashed rgba(139, 69, 19, 0.15);
+  border-bottom: 1px dashed rgba(139, 69, 19, 0.15);
+  text-align: center;
+  font-size: 11px;
+  user-select: none;
+}
+
+/* ── Edit view ── */
+
+.enrich-diff-edit-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding: 6px 16px;
+  border-bottom: 1px solid rgba(139, 69, 19, 0.10);
+  background: #FBF6EE;
+  font-size: 12px;
+  color: #6A5238;
+  flex-shrink: 0;
+}
+
+.enrich-diff-sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.enrich-diff-sync-toggle input[type="checkbox"] {
+  cursor: pointer;
+}
+
+.enrich-diff-edit-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto 1fr;
+  height: calc(100% - 33px);  /* leave room for the toolbar */
+  /* Body's overflow:auto wraps this; let the textareas handle scrolling. */
+  align-items: stretch;
+}
+
+.enrich-diff-textarea {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  color: #3D2A18;
+  background: #FFFBF4;
+  border: none;
+  border-top: 1px solid rgba(139, 69, 19, 0.10);
+  padding: 12px 16px;
+  resize: none;
+  outline: none;
+  white-space: pre;
+  overflow: auto;
+}
+
+.enrich-diff-textarea + .enrich-diff-textarea {
+  border-left: 1px solid rgba(139, 69, 19, 0.10);
+  background: #FFFFFF;     /* subtle distinction for the editable side */
+}
+
+.enrich-diff-textarea:focus {
+  background: #FFFFFF;
+  box-shadow: inset 0 0 0 1px rgba(139, 69, 19, 0.25);
+}
+
+.enrich-diff-textarea[readonly] {
+  cursor: default;
+}
+
+/* ── Footer ── */
+
+.enrich-diff-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1.5px solid rgba(139, 69, 19, 0.12);
+  flex-shrink: 0;
+  background: #FBF6EE;
+}
+
+.enrich-diff-reject,
+.enrich-diff-accept {
+  padding: 7px 18px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.05s;
+}
+
+.enrich-diff-reject {
+  background: transparent;
+  border: 1.5px solid rgba(139, 69, 19, 0.30);
+  color: #6A5238;
+}
+
+.enrich-diff-reject:hover:not(:disabled) {
+  background: rgba(139, 69, 19, 0.08);
+}
+
+.enrich-diff-accept {
+  background: linear-gradient(135deg, #8B4513 0%, #A05A28 100%);
+  border: 1.5px solid #6A3410;
+  color: white;
+}
+
+.enrich-diff-accept:hover:not(:disabled) {
+  background: linear-gradient(135deg, #7A3D11 0%, #8C4D20 100%);
+}
+
+.enrich-diff-reject:disabled,
+.enrich-diff-accept:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

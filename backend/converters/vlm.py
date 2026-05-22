@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -21,6 +22,7 @@ import httpx
 
 from backend.registry import register_converter
 from backend.utils.retry import async_retry_with_backoff
+from .vlm_checkpoint import CheckpointStore
 from .base import PDFConverter
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,21 @@ def _get_default_base_url() -> str:
     return os.getenv("OLLAMA_BASE_URL", _gs().VLM_DEFAULT_BASE_URL)
 
 
+@dataclass(slots=True)
+class _PageResult:
+    """Per-page outcome carried through asyncio.gather.
+
+    Exactly one of ``markdown`` and ``error`` is populated. ``cached`` is
+    True when the result was loaded from the checkpoint store and no API
+    call was made.
+    """
+
+    page_num: int          # 0-indexed
+    markdown: str | None
+    error: str | None
+    cached: bool = False
+
+
 @register_converter(
     name="vlm",
     label="VLM (Vision-Language Model)",
@@ -113,6 +130,24 @@ class VLMConverter(PDFConverter):
     no longer used: ``AsyncOpenAI`` creates its own ``httpx.AsyncClient``
     inside ``_async_convert()`` so it stays bound to the correct event loop.
 
+    Resilience features (see ``vlm_checkpoint.py`` for the on-disk format):
+
+        * **Graceful per-page failure** — a transient or model-level error on
+          one page no longer aborts the entire job. Failed pages get an
+          inline ``<!-- page N failed: … -->`` placeholder in the final
+          Markdown and the job runs to completion.
+        * **Per-page checkpointing** — every successful page is persisted
+          to ``mds/.checkpoints/{stem}_vlm/`` as it completes. An interrupted
+          job resumes from the last cached page on the next run, skipping
+          both rendering and the API call.
+
+    After ``convert()`` returns, callers may read:
+
+        * :attr:`failed_pages` — sorted list of 1-indexed page numbers that
+          failed transcription (empty when the document is clean).
+        * :attr:`resumed_from_pages` — count of pages that were loaded from
+          the checkpoint at the start (0 when no checkpoint was used).
+
     Provider examples::
 
         # Ollama (default) — no API key required
@@ -135,6 +170,7 @@ class VLMConverter(PDFConverter):
         user_prompt: str | None = None,
         on_progress: Callable[[int, int], None] | None = None,
         stop_event: threading.Event | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         from backend.config import get_settings as _get_settings
         _s = _get_settings()
@@ -155,6 +191,11 @@ class VLMConverter(PDFConverter):
             write=_s.VLM_WRITE_TIMEOUT_S,
             pool=_s.HTTP_POOL_TIMEOUT_S,
         )
+        self._checkpoint_store = checkpoint_store
+
+        # Populated by convert() — read by the caller for SSE / response payload.
+        self.failed_pages: list[int] = []
+        self.resumed_from_pages: int = 0
 
     # ------------------------------------------------------------------
     # PDFConverter interface
@@ -174,6 +215,10 @@ class VLMConverter(PDFConverter):
 
         Returns:
             Full document as Markdown, pages separated by ``\\n\\n---\\n\\n``.
+            Pages that failed transcription are represented by an inline
+            ``<!-- page N failed: … -->`` placeholder; the page count and
+            ordering is preserved so downstream tooling can still rely on
+            page-marker comments.
         """
         self.validate_path(pdf_path)
         return asyncio.run(self._async_convert(pdf_path, total_pages))
@@ -190,6 +235,12 @@ class VLMConverter(PDFConverter):
         Peak memory is bounded to ``_MAX_CONCURRENT_PAGES × (one page PNG)``
         instead of ``total_pages × (one page PNG)``, which for a 100-page
         document at 300 DPI can be the difference between ~30 MB and ~1.5 GB.
+
+        Pages already present in the checkpoint store skip both the
+        rendering and the API call: they are loaded synchronously from disk
+        and feed directly into the progress callback.  Cached loads do not
+        acquire the concurrency semaphore — the semaphore bounds peak memory
+        for in-flight page PNGs, which cached loads do not produce.
         """
         loop = asyncio.get_running_loop()
 
@@ -204,6 +255,18 @@ class VLMConverter(PDFConverter):
                 with fitz.open(str(pdf_path)) as doc:
                     return doc.page_count
             total = await loop.run_in_executor(None, _get_page_count)
+
+        # ── Resolve which pages are already cached ───────────────────────────
+        # We snapshot this once up-front so progress reporting and the
+        # ``resumed_from_pages`` summary stay coherent even if files were to
+        # appear under the checkpoint dir mid-run (they shouldn't — only the
+        # converter writes there — but the snapshot keeps the logic simple).
+        cached_pages: set[int] = set()
+        if self._checkpoint_store is not None:
+            for p in self._checkpoint_store.completed_pages():
+                if 0 <= p < total:
+                    cached_pages.add(p)
+        self.resumed_from_pages = len(cached_pages)
 
         # ── Transcribe pages concurrently (render + API call per task) ───────
         # Each task renders its own page inside the executor and immediately
@@ -220,10 +283,32 @@ class VLMConverter(PDFConverter):
                 http_client=http,
             )
 
-            async def _process(page_num: int) -> str:
+            async def _process(page_num: int) -> _PageResult:
                 nonlocal completed_pages
                 if self._stop_event and self._stop_event.is_set():
                     raise InterruptedError("Conversion cancelled before page")
+
+                # ── Fast path: checkpoint cache hit ──────────────────────────
+                # Skip semaphore acquisition entirely — cached loads do not
+                # consume the per-page memory budget that the semaphore guards.
+                if page_num in cached_pages and self._checkpoint_store is not None:
+                    try:
+                        cached_md = await loop.run_in_executor(
+                            None, self._checkpoint_store.load_page, page_num
+                        )
+                    except OSError as exc:
+                        # Corrupt or unreadable checkpoint — fall through to
+                        # a fresh transcription rather than failing the page.
+                        logger.warning(
+                            "Failed to load checkpoint for page %d: %s — re-transcribing",
+                            page_num + 1, exc,
+                        )
+                        cached_pages.discard(page_num)
+                    else:
+                        completed_pages += 1
+                        if self._on_progress:
+                            self._on_progress(completed_pages, total)
+                        return _PageResult(page_num=page_num, markdown=cached_md, error=None, cached=True)
 
                 # Render this page in the executor (CPU-bound, releases GIL).
                 # Re-opening the PDF is cheap — fitz uses OS-level page caching.
@@ -233,16 +318,55 @@ class VLMConverter(PDFConverter):
                             raise InterruptedError("Conversion cancelled during rendering")
                         return self._render_page_as_b64(doc[page_num])
 
-                async with sem:
-                    img_b64 = await loop.run_in_executor(None, _render_one)
-                    markdown = await self._transcribe_page_with_retry_async(
-                        client, img_b64, page_num=page_num
+                try:
+                    async with sem:
+                        img_b64 = await loop.run_in_executor(None, _render_one)
+                        markdown = await self._transcribe_page_with_retry_async(
+                            client, img_b64, page_num=page_num
+                        )
+                except (asyncio.CancelledError, InterruptedError):
+                    # Cancellation must propagate so the gather/watcher logic
+                    # below can drain in-flight tasks and surface the
+                    # InterruptedError to the caller.
+                    raise
+                except Exception as exc:
+                    # Treat every other exception as a per-page failure: log,
+                    # record a placeholder, and let the rest of the job
+                    # continue.  This includes APIStatusError (4xx/5xx after
+                    # retries are exhausted), the empty-choices ValueError,
+                    # JSON decoding errors from broken model output, etc.
+                    error_summary = f"{type(exc).__name__}: {str(exc)[:200]}"
+                    logger.warning(
+                        "Page %d transcription failed — recording placeholder: %s",
+                        page_num + 1, error_summary,
+                        extra={"model": self._model, "page_num": page_num},
                     )
+                    completed_pages += 1
+                    if self._on_progress:
+                        self._on_progress(completed_pages, total)
+                    return _PageResult(page_num=page_num, markdown=None, error=error_summary, cached=False)
+
+                # ── Successful transcription ─────────────────────────────────
+                # Persist to checkpoint BEFORE counting the page as done so a
+                # crash between save and progress callback can't lose work.
+                if self._checkpoint_store is not None:
+                    try:
+                        await loop.run_in_executor(
+                            None, self._checkpoint_store.save_page, page_num, markdown
+                        )
+                    except OSError as exc:
+                        # A failed checkpoint save is non-fatal — the page
+                        # markdown is still returned in-memory.  Next run will
+                        # simply re-transcribe this page.
+                        logger.warning(
+                            "Failed to save checkpoint for page %d: %s",
+                            page_num + 1, exc,
+                        )
 
                 completed_pages += 1
                 if self._on_progress:
                     self._on_progress(completed_pages, total)
-                return markdown
+                return _PageResult(page_num=page_num, markdown=markdown, error=None, cached=False)
 
             page_tasks = [asyncio.create_task(_process(i)) for i in range(total)]
 
@@ -265,11 +389,12 @@ class VLMConverter(PDFConverter):
 
             watcher = asyncio.create_task(_cancellation_watcher())
             try:
-                results = list(await asyncio.gather(*page_tasks))
+                results: list[_PageResult] = list(await asyncio.gather(*page_tasks))
             except (Exception, asyncio.CancelledError):
-                # Cancel any tasks still in flight (covers both InterruptedError
-                # raised by a stop_event check and CancelledError injected by
-                # the watcher), then wait for them to drain cleanly.
+                # Per-page exceptions are now caught inside ``_process`` — the
+                # only exceptions that can escape are cancellation signals
+                # (InterruptedError, CancelledError) propagated explicitly.
+                # Drain any in-flight tasks before re-raising.
                 for t in page_tasks:
                     t.cancel()
                 await asyncio.gather(*page_tasks, return_exceptions=True)
@@ -283,7 +408,22 @@ class VLMConverter(PDFConverter):
                 except Exception as _exc:
                     logger.warning("Error awaiting watcher cancellation: %s", _exc)
 
-        parts = [f"<!-- page-marker:{i + 1} -->\n{md}" for i, md in enumerate(results)]
+        # ── Assemble final Markdown, recording failures ───────────────────────
+        self.failed_pages = sorted(r.page_num + 1 for r in results if r.error is not None)
+        if self.failed_pages:
+            logger.warning(
+                "VLM conversion finished with %d failed page(s): %s",
+                len(self.failed_pages), self.failed_pages,
+            )
+
+        parts: list[str] = []
+        for r in results:
+            page_marker = f"<!-- page-marker:{r.page_num + 1} -->"
+            if r.error is not None:
+                body = f"<!-- page {r.page_num + 1} failed: {r.error} -->"
+            else:
+                body = r.markdown or ""
+            parts.append(f"{page_marker}\n{body}")
         return "\n\n---\n\n".join(parts)
 
     # ------------------------------------------------------------------

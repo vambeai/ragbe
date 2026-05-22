@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import AsyncGenerator
@@ -53,7 +52,11 @@ from backend.models.schemas import (
 from backend.services.chunk_storage_service import ChunkStorageService
 from backend.services.chunking_service import _init_chunk_worker, chunk_file_in_process
 from backend.utils.executor import cancel_cpu_executor
-from backend.utils.sse import sse_error as _sse_error, sse_event as _sse, sse_timeout_tick
+from backend.utils.sse import (
+    run_sse_event_loop,
+    sse_error as _sse_error,
+    sse_event as _sse,
+)
 
 router = APIRouter(prefix="/api", tags=["chunks"])
 _storage = ChunkStorageService()
@@ -202,48 +205,31 @@ async def chunk_documents(http_request: Request, request: ChunkFilesRequest):
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
-        last_event = time.monotonic()
-        last_heartbeat = time.monotonic()
-
-        try:
-            while True:
-                if await http_request.is_disconnected():
-                    logger.info("Client disconnected — cancelling %d chunk job(s)", total)
-                    await _cancel_all()
-                    yield _sse({"type": "cancelled"})
-                    return
-
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=queue_timeout_s)
-                except asyncio.TimeoutError:
-                    last_heartbeat, do_heartbeat, watchdog_fired = sse_timeout_tick(
-                        last_event, last_heartbeat, watchdog_s
-                    )
-                    if do_heartbeat:
-                        yield ": heartbeat\n\n"
-                    if watchdog_fired:
-                        logger.error(
-                            "Chunk watchdog fired: no event for %.0fs — cancelling all jobs", watchdog_s
-                        )
-                        await _cancel_all()
-                        yield _sse_error(504, f"No progress for {watchdog_s:.0f}s — operation timed out")
-                        return
-                    continue
-
-                if event is None:
-                    break
-
-                yield _sse(event)
-                last_event = last_heartbeat = time.monotonic()
-
-            yield _sse({"type": "batch_done", "succeeded": succeeded, "failed": failed})
-        except asyncio.CancelledError:
-            await _cancel_all()
-            yield _sse({"type": "cancelled"})
-        finally:
+        async def _safe_cancel() -> None:
+            # Idempotent wrapper: skip the (potentially expensive) executor
+            # swap when the runner has already finished.  This matches the
+            # original "finally only runs if not runner.done()" safety-net
+            # semantics now that the helper invokes on_cancel in finally.
             if not runner.done():
-                runner.cancel()
-                await asyncio.gather(runner, return_exceptions=True)
+                await _cancel_all()
+
+        def _handle(event: dict) -> tuple[str, bool]:
+            return _sse(event), False
+
+        def _on_complete():
+            return [_sse({"type": "batch_done", "succeeded": succeeded, "failed": failed})]
+
+        async for frame in run_sse_event_loop(
+            queue=queue,
+            http_request=http_request,
+            on_cancel=_safe_cancel,
+            handle_event=_handle,
+            watchdog_s=watchdog_s,
+            queue_timeout_s=queue_timeout_s,
+            log_name=f"chunking ({total} job(s))",
+            on_complete=_on_complete,
+        ):
+            yield frame
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

@@ -88,6 +88,14 @@ class VLMSettings(BaseModel):
     api_key: str | None = Field(default=None)
     temperature: float | None = Field(default=None)
     user_prompt: str | None = Field(default=None)
+    use_checkpoint: bool = Field(
+        default=True,
+        description=(
+            "When true, resume from per-page checkpoints saved by a previous "
+            "interrupted conversion (if any). When false, discard any existing "
+            "checkpoint and reconvert from page 1."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +155,23 @@ class ConvertResponse(BaseModel):
     md_filename: str
     message: str
     md_content: str
+    failed_pages: list[int] | None = Field(
+        default=None,
+        description=(
+            "1-indexed page numbers that could not be transcribed. Populated "
+            "only by the VLM converter; null for converters that cannot "
+            "report per-page failures."
+        ),
+    )
+    resumed_pages: int | None = Field(
+        default=None,
+        description=(
+            "Number of pages that were loaded from the checkpoint at the "
+            "start of this conversion (i.e. skipped both the rendering and "
+            "the API call). Null when checkpointing is not applicable to "
+            "the converter."
+        ),
+    )
 
 
 class DeleteResponse(BaseModel):
@@ -299,6 +324,15 @@ class MarkdownVersion(BaseModel):
         description="Normalised converter name when source is 'converted'.",
     )
     file_path: str
+    has_failures: bool = Field(
+        default=False,
+        description=(
+            "True when this variant's content contains one or more "
+            "``<!-- page N failed: … -->`` placeholders left by the VLM "
+            "converter after a partial run.  Used by the UI to mark the "
+            "specific variant in the version picker."
+        ),
+    )
 
 
 class MarkdownVersionsResponse(BaseModel):
@@ -311,6 +345,19 @@ class MarkdownContentResponse(BaseModel):
     source: str
     converter: str | None = None
     content: str
+
+
+class CheckpointInfoResponse(BaseModel):
+    """Per-document checkpoint state, surfaced to the UI so it can show a
+    "Resume available" indicator before the user kicks off a conversion."""
+
+    document_name: str
+    converter: str = Field(default="vlm", description="Converter token the checkpoint belongs to.")
+    exists: bool = Field(description="True when at least one cached page is on disk.")
+    completed_pages: list[int] = Field(
+        default_factory=list,
+        description="Sorted 1-indexed list of page numbers already cached on disk.",
+    )
 
 
 class ChunksVersion(BaseModel):
@@ -367,9 +414,37 @@ class EnrichmentRequest(BaseModel):
     user_prompt: str | None = None
 
 
-class EnrichMarkdownRequest(BaseModel):
-    content: str = Field(..., min_length=1, max_length=10_000_000)
+class EnrichPipelineRequest(BaseModel):
+    """Body for POST /api/enrich/markdown/pipeline.
+
+    Drives the full regex-cleanup → structure-aware-split → per-piece-LLM
+    pipeline (see :mod:`backend.services.enrichment_pipeline`).  ``filename``
+    must reference a stored Markdown file; the pipeline pulls the source
+    content from disk so the checkpoint key stays stable across requests
+    that re-send identical content as ``content``.
+    """
+
+    filename: str = Field(..., description="Stored markdown filename (e.g. 'report_vlm.md').")
     settings: EnrichmentRequest
+    use_checkpoint: bool = Field(
+        default=True,
+        description=(
+            "When true, resume from any cached pieces left by a previous "
+            "pipeline run.  When false, discard the cache and reconvert "
+            "every piece from scratch."
+        ),
+    )
+    use_summary: bool = Field(
+        default=True,
+        description=(
+            "When true (default), attach any cached document-level summary "
+            "to every piece prompt.  When false, ignore the cached "
+            "summary for this run — equivalent to running enrichment "
+            "without a summary.  Used by the SummaryReviewModal's Skip "
+            "button and by the Settings → Skip document summary "
+            "preference to opt out of document-level context."
+        ),
+    )
 
 
 class ChunkToEnrich(BaseModel):
@@ -383,3 +458,79 @@ class ChunkToEnrich(BaseModel):
 class EnrichChunksRequest(BaseModel):
     chunks: list[ChunkToEnrich] = Field(..., min_length=1)
     settings: EnrichmentRequest
+    md_filename: str | None = Field(
+        default=None,
+        description=(
+            "Optional markdown variant filename (e.g. 'report_vlm.md'). "
+            "When provided AND a document-level summary exists on disk "
+            "for the corresponding PDF, that summary is attached to "
+            "every chunk-enrichment prompt as document-level context. "
+            "Absent: chunk enrichment runs without context (the prior "
+            "behaviour).  Chunk enrichment never generates a summary "
+            "itself — that happens in the markdown enrichment flow's "
+            "review modal."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Document-summary endpoints
+# ---------------------------------------------------------------------------
+
+
+class DocumentSummaryPayload(BaseModel):
+    """Wire-level shape of a :class:`DocumentSummary` (see
+    :mod:`backend.services.document_summary`).
+
+    Minimal — only ``topic`` and ``narrative``.  Field names match the
+    dataclass and the on-disk JSON so the frontend stores what it
+    receives without translation.
+    """
+
+    topic: str = ""
+    narrative: str = ""
+
+
+class DocumentSummaryStatus(BaseModel):
+    """Metadata surfaced alongside the summary content."""
+
+    user_edited: bool
+    generated_at: str
+
+
+class DocumentSummaryResponse(BaseModel):
+    """Body of ``GET /api/enrich/summary`` and the ``done`` event of
+    ``POST /api/enrich/summary/generate``."""
+
+    filename: str
+    doc_stem: str
+    summary: DocumentSummaryPayload
+    status: DocumentSummaryStatus
+
+
+class SummaryGenerateRequest(BaseModel):
+    """Body of ``POST /api/enrich/summary/generate``.
+
+    ``force`` discards any cached record before generation so the modal's
+    Regenerate button produces a fresh summary even when one already
+    exists.  When ``force`` is false, an existing record (even an old
+    LLM-generated one) is returned as a fast path and no LLM calls are
+    made.
+    """
+
+    filename: str = Field(..., description="Stored markdown filename (e.g. 'report_vlm.md').")
+    settings: EnrichmentRequest
+    force: bool = Field(default=False)
+
+
+class SummaryUpdateRequest(BaseModel):
+    """Body of ``PUT /api/enrich/summary``.
+
+    Persists the user-edited summary with ``user_edited=True`` so future
+    enrichment runs treat the edit as authoritative.  Piece extractions
+    and source-hash metadata are carried over from the existing record
+    so a later Regenerate can still benefit from the per-piece cache.
+    """
+
+    filename: str = Field(..., description="Stored markdown filename (e.g. 'report_vlm.md').")
+    summary: DocumentSummaryPayload
