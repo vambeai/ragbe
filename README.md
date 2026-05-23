@@ -1,9 +1,8 @@
 <p align="center">
   <img alt="Chunky Logo" src="assets/logo.png" width="350px">
 </p>
-<h1 align="center">Chunky</h1>
-<p align="center">
-    <strong>Validate your Markdown. Validate your chunks. Ship RAG pipelines that actually work.</strong>
+<h1 align="center">Chunky – RAG Chunking & Markdown Processing Toolkit</h1><p align="center">
+    <strong>Convert Markdown, validate structure, and visualize chunking strategies to build reliable RAG pipelines.</strong>
 </p>
 <p align="center">
 <img src="https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white"/>
@@ -20,6 +19,8 @@
 </p>
 
 ---
+
+Chunky is an open-source toolkit for preparing documents for Retrieval-Augmented Generation (RAG), combining Markdown validation, document preprocessing, and advanced chunking strategies (semantic, token-based, and structure-aware) for LLM applications.
 
 ## Why Chunky?
 
