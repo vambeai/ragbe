@@ -1,7 +1,8 @@
 <p align="center">
   <img alt="Chunky Logo" src="assets/logo.png" width="350px">
 </p>
-<h1 align="center">Chunky – RAG Chunking & Markdown Processing Toolkit</h1><p align="center">
+<h1 align="center">Chunky – RAG Chunking & Markdown Processing Toolkit</h1>
+<p align="center">
     <strong>Convert Markdown, validate structure, and visualize chunking strategies to build reliable RAG pipelines.</strong>
 </p>
 <p align="center">
@@ -20,9 +21,9 @@
 
 ---
 
-Chunky is an open-source toolkit for preparing documents for Retrieval-Augmented Generation (RAG), combining Markdown validation, document preprocessing, and advanced chunking strategies (semantic, token-based, and structure-aware) for LLM applications.
+## Overview
 
-## Why Chunky?
+Chunky is an open-source toolkit for preparing documents for Retrieval-Augmented Generation (RAG), combining Markdown validation, document preprocessing, and advanced chunking strategies (semantic, token-based, and structure-aware) for LLM applications.
 
 Most RAG pipelines fail silently — and when they do, the cause is often bad Markdown, bad chunking, or both. When PDFs are converted, tables collapse, layouts scramble, and artifacts bleed into your text. You never see it. You just get hallucinations downstream. Chunky is a local, open-source tool that gives you full visibility at both stages — validate your Markdown, validate your chunks, fix what's wrong before it reaches your vector store.
 
@@ -64,7 +65,6 @@ cd chunky
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-npm install -g @llamaindex/liteparse  # optional — only needed for the LiteParse converter
 ./start_all.sh
 ```
 
@@ -95,8 +95,6 @@ No single converter wins on every document type. Chunky ships with six — switc
 | **LiteParse** | `liteparse` | Fast, lightweight parsing by LlamaIndex — good for standard documents |
 | **VLM** | `openai` + any vision model | Scanned PDFs, handwriting, diagrams — anything a human can read |
 | **Cloud API** | `httpx` | POSTs the PDF to a configurable external endpoint and returns the Markdown response body directly |
-
-> **Note:** The **LiteParse** converter requires Node.js and the CLI installed separately: `npm install -g @llamaindex/liteparse`
 
 ### VLM converter
 

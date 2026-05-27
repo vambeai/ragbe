@@ -3,7 +3,7 @@ docling==2.95.0
 fastapi==0.136.1
 httpx==0.28.1
 langchain-text-splitters==1.1.2
-liteparse==1.2.1
+liteparse==2.0.0
 markdown-pdf==1.13.1
 markitdown[pdf]==0.1.5
 model2vec==0.8.1
