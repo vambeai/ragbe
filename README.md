@@ -41,16 +41,14 @@ As [NVIDIA's research](https://developer.nvidia.com/blog/finding-the-best-chunki
 
 | | |
 |---|---|
-| 📄 **Side-by-side viewer** | PDF and Markdown side by side for easy comparison and validation |
-| ✨ **Six PDF → Markdown converters** | PyMuPDF, Docling, MarkItDown, LiteParse, VLM, Cloud API |
-| 🔄 **Re-convert on the fly** | Switch converter and regenerate without restarting the pipeline |
-| 📦 **Bulk PDF conversion** | Convert multiple PDFs to Markdown in a single batch operation |
-| ✂️ **14 chunking strategies** | LangChain (4 strategies), Chonkie (8 strategies) and Docling (2 strategies) |
-| 📚 **Bulk chunking** | Chunk multiple Markdown files at once with the same configuration |
-| 🧠 **Markdown enrichment** | Clean conversion artifacts before chunking |
-| ✨ **Chunk enrichment** | Context-aware LLM metadata for selected chunks or bulk saved chunk sets |
-| 🔌 **Pluggable architecture** | Add a converter or splitter in minutes — zero frontend changes |
-| 💾 **Export** | JSON chunks, ready for your vector store |
+| 📄 **Document review workspace** | Compare PDF, Markdown, and chunks side by side before indexing |
+| ✨ **Multiple conversion engines** | PyMuPDF, Docling, MarkItDown, LiteParse, VLM, and Cloud API support |
+| 📦 **Batch processing** | Convert, enrich, and chunk multiple documents from the sidebar |
+| ✂️ **Chunking strategy comparison** | Test LangChain, Chonkie, and Docling splitters with configurable size and overlap |
+| 💾 **Saved chunk versions** | Persist and reload chunk sets by Markdown source and splitter configuration |
+| 🧠 **Markdown enrichment** | Clean conversion artifacts with deterministic cleanup plus LLM correction |
+| ✨ **Chunk enrichment** | Generate context-aware titles, summaries, keywords, and retrieval questions |
+| 🔌 **Pluggable backend** | Add converters or splitters through the registry without frontend changes |
 
 ---
 
@@ -157,7 +155,7 @@ Before chunking, you can run enrichment directly on the converted Markdown. The 
 
 1. **Regex pass** — automatically corrects common conversion artifacts (broken tables, stray escape characters, malformed headers)
 2. **LLM correction** — splits the document into pieces and sends each to an LLM for contextual cleanup, producing coherent, well-structured Markdown
-3. **Summary** *(optional)* — generates a document-level summary prepended to the cleaned output
+3. **Summary** *(optional)* — generates a document-level summary used as context during LLM correction
 
 Markdown enrichment is available for both single files and **bulk operations**, so you can clean an entire batch of converted PDFs in one pass.
 
