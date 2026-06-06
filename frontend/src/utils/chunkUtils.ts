@@ -56,19 +56,46 @@ export function missingEnrichmentModelError(label: string): string {
  * Used by every code path that ingests chunks coming back from the backend
  * so the normalisation logic isn't repeated in three places.
  */
+function asString(value: unknown): string {
+  return value == null ? '' : String(value)
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : fallback
+}
+
+function asStringList(value: unknown): string[] {
+  if (value == null) return []
+  if (typeof value === 'string') {
+    const item = value.trim()
+    return item ? [item] : []
+  }
+  if (!Array.isArray(value)) return []
+  return value
+    .map(item => asString(item).trim())
+    .filter(Boolean)
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
 export function normaliseChunk(raw: Partial<Chunk> & { index: number; content: string }): Chunk {
   return {
-    index: raw.index,
-    content: raw.content,
-    cleaned_chunk: raw.cleaned_chunk ?? '',
-    title: raw.title ?? '',
-    context: raw.context ?? '',
-    summary: raw.summary ?? '',
-    keywords: raw.keywords ?? [],
-    questions: raw.questions ?? [],
-    metadata: raw.metadata ?? {},
-    start: raw.start ?? 0,
-    end: raw.end ?? 0,
+    index: asNumber(raw.index),
+    content: asString(raw.content),
+    cleaned_chunk: asString(raw.cleaned_chunk),
+    title: asString(raw.title),
+    context: asString(raw.context),
+    summary: asString(raw.summary),
+    keywords: asStringList(raw.keywords),
+    questions: asStringList(raw.questions),
+    metadata: asRecord(raw.metadata),
+    start: asNumber(raw.start),
+    end: asNumber(raw.end),
   }
 }
 

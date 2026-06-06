@@ -192,6 +192,7 @@ export function useBulkOps({
     const { signal } = bulkAbortRef.current
 
     setBulkOp({ title: 'Batch Chunking', detail: '', current: 0, total: filenames.length })
+    setBulkConnectionLost(false)
 
     let succeeded = 0
     let failed = 0

@@ -114,6 +114,7 @@ export async function chunkSse(
   if (!res.body) throw new Error('No response body')
 
   let firstFileChunks: Chunk[] = []
+  let sawBatchDone = false
   for await (const event of parseSse(res.body, onConnectionLost)) {
     if (event.type === 'file_start') {
       onFileStart?.(event.filename as string, event.index as number, event.total as number)
@@ -129,6 +130,7 @@ export async function chunkSse(
         throw new Error(String(event.error ?? 'Chunking failed'))
       }
     } else if (event.type === 'batch_done') {
+      sawBatchDone = true
       break
     } else if (event.type === 'error') {
       throw new Error(String(event.message ?? 'Chunking error'))
@@ -136,5 +138,6 @@ export async function chunkSse(
       throw new DOMException('Chunking cancelled', 'AbortError')
     }
   }
+  if (!sawBatchDone) throw new Error('Chunking stream ended without completion')
   return firstFileChunks
 }

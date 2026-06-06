@@ -117,25 +117,28 @@ export function useDocument(toast: ToastCallbacks) {
     if (!filename) return
 
     fetchDocAbortRef.current?.abort()
-    fetchDocAbortRef.current = new AbortController()
+    const abortCtrl = new AbortController()
+    fetchDocAbortRef.current = abortCtrl
 
     setLoading(true)
     try {
       const res = await fetch(
         `${API}/document/${encodeURIComponent(filename)}`,
-        { signal: fetchDocAbortRef.current.signal },
+        { signal: abortCtrl.signal },
       )
       if (!res.ok) throw new Error()
       const data: DocumentData = await res.json()
+      if (fetchDocAbortRef.current !== abortCtrl || selectedDocRef.current !== filename) return
       setDocumentData(data)
       fetchVersions(filename).then(versions => {
+        if (selectedDocRef.current !== filename) return
         const match = versions.find(v => v.filename === data.md_filename)
         setSelectedMarkdown(match?.filename ?? versions[0]?.filename ?? null)
       }).catch(() => {})
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return
     } finally {
-      setLoading(false)
+      if (fetchDocAbortRef.current === abortCtrl) setLoading(false)
     }
   }, [fetchVersions])
 
@@ -143,7 +146,8 @@ export function useDocument(toast: ToastCallbacks) {
     if (filename === selectedDocRef.current) return
 
     fetchDocAbortRef.current?.abort()
-    fetchDocAbortRef.current = new AbortController()
+    const abortCtrl = new AbortController()
+    fetchDocAbortRef.current = abortCtrl
 
     convertAbortRef.current?.abort()
     setConverting(false)
@@ -159,13 +163,15 @@ export function useDocument(toast: ToastCallbacks) {
     try {
       const res = await fetch(
         `${API}/document/${encodeURIComponent(filename)}`,
-        { signal: fetchDocAbortRef.current.signal },
+        { signal: abortCtrl.signal },
       )
       if (!res.ok) throw new Error()
       const data: DocumentData = await res.json()
+      if (fetchDocAbortRef.current !== abortCtrl || selectedDocRef.current !== filename) return
       setDocumentData(data)
       // Kick off the version-list fetch in parallel; doesn't block first paint.
       fetchVersions(filename).then(versions => {
+        if (selectedDocRef.current !== filename) return
         const match = versions.find(v => v.filename === data.md_filename)
         setSelectedMarkdown(match?.filename ?? versions[0]?.filename ?? null)
       }).catch(() => {})
@@ -173,7 +179,7 @@ export function useDocument(toast: ToastCallbacks) {
       if (err instanceof DOMException && err.name === 'AbortError') return
       toastRef.current.onError(`Failed to load "${filename}"`)
     } finally {
-      setLoading(false)
+      if (fetchDocAbortRef.current === abortCtrl) setLoading(false)
     }
   }, [fetchVersions])
 
@@ -326,6 +332,7 @@ export function useDocument(toast: ToastCallbacks) {
     if (!selectedDocRef.current) return
 
     const docAtStart = selectedDocRef.current
+    const mdFilename = documentDataRef.current?.md_filename ?? docAtStart
     convertToPdfAbortRef.current?.abort()
     const abortCtrl = new AbortController()
     convertToPdfAbortRef.current = abortCtrl
@@ -333,7 +340,7 @@ export function useDocument(toast: ToastCallbacks) {
     setConvertingToPdf(true)
     try {
       const res = await fetch(
-        `${API}/md-to-pdf/${encodeURIComponent(docAtStart)}`,
+        `${API}/md-to-pdf/${encodeURIComponent(mdFilename)}`,
         { method: 'POST', signal: abortCtrl.signal },
       )
       if (!res.ok) throw new Error()
@@ -447,6 +454,7 @@ export function useDocument(toast: ToastCallbacks) {
     }
     if (!res.body) throw new Error('No response body')
 
+    let completed = false
     for await (const event of parseSse(res.body, onConnectionLost)) {
       if (event.type === 'progress') {
         onPageProgress?.(
@@ -476,10 +484,14 @@ export function useDocument(toast: ToastCallbacks) {
           event.percentage as number,
         )
         await new Promise<void>(r => setTimeout(r, 0))
-      } else if (event.type === 'batch_done' || event.type === 'cancelled') {
+      } else if (event.type === 'batch_done') {
+        completed = true
+        return
+      } else if (event.type === 'cancelled') {
         return
       }
     }
+    if (!completed) throw new Error('Conversion stream ended without completion')
   }, [])
 
   return {

@@ -196,11 +196,13 @@ export function useChunkEnrichment({
         end: currentChunks[i].end ?? 0,
         metadata: (currentChunks[i].metadata ?? {}) as Record<string, unknown>,
       }))
+    if (chunksToEnrich.length === 0) return
 
+    bulkEnrichAbortRef.current?.abort()
     const abortCtrl = new AbortController()
     bulkEnrichAbortRef.current = abortCtrl
 
-    setChunkEnrichOp({ title: 'Chunk Enrichment', detail: '', current: 0, total: indices.length })
+    setChunkEnrichOp({ title: 'Chunk Enrichment', detail: '', current: 0, total: chunksToEnrich.length })
 
     let enrichedCount = 0
     let wasAborted = false

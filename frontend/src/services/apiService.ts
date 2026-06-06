@@ -203,18 +203,11 @@ export async function apiEnrichMarkdownPipeline(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
-    body: JSON.stringify({
+    body: JSON.stringify(buildEnrichmentBody(settings, {
       filename,
       use_checkpoint: useCheckpoint,
       use_summary: useSummary,
-      settings: {
-        model: settings.model,
-        base_url: settings.base_url ?? DEFAULT_ENRICHMENT_BASE_URL,
-        api_key: settings.api_key ?? 'ollama',
-        temperature: settings.temperature ?? DEFAULT_ENRICHMENT_TEMPERATURE,
-        user_prompt: settings.user_prompt,
-      },
-    }),
+    })),
   })
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText)
@@ -312,6 +305,8 @@ export async function apiEnrichChunks(
   onProgress?: (progress: ChunkEnrichmentProgress) => void,
   onConnectionLost?: () => void,
 ): Promise<ChunkEnrichmentBatchResult> {
+  if (chunks.length === 0) return { chunks: [], succeeded: 0, failed: 0 }
+
   const res = await fetch(`${API_BASE}/enrich/chunks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -445,17 +440,10 @@ export async function apiGenerateSummary(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
-    body: JSON.stringify({
+    body: JSON.stringify(buildEnrichmentBody(settings, {
       filename,
       force,
-      settings: {
-        model: settings.model,
-        base_url: settings.base_url ?? DEFAULT_ENRICHMENT_BASE_URL,
-        api_key: settings.api_key ?? 'ollama',
-        temperature: settings.temperature ?? DEFAULT_ENRICHMENT_TEMPERATURE,
-        user_prompt: settings.user_prompt,
-      },
-    }),
+    })),
   })
   if (!res.ok) {
     const errText = await res.text().catch(() => res.statusText)
