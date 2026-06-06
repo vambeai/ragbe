@@ -128,6 +128,16 @@ class Settings(BaseSettings):
     """Max concurrent LLM calls for chunk enrichment across all active requests.
     Set to 1 for single-GPU local models (e.g. Ollama) to avoid request queuing."""
 
+    ENRICHMENT_CHUNK_CONTEXT_BEFORE_CHARS: int = 1200
+    """Characters of source Markdown immediately before a chunk to include as
+    read-only context during chunk enrichment. Set to 0 to disable preceding
+    context while still allowing document-summary context."""
+
+    ENRICHMENT_CHUNK_CONTEXT_AFTER_CHARS: int = 800
+    """Characters of source Markdown immediately after a chunk to include as
+    read-only context during chunk enrichment. Set to 0 to disable following
+    context while still allowing document-summary context."""
+
     ENRICHMENT_DEFAULT_MODEL: str = "qwen3-vl:4b-instruct-q4_K_M"
     """Default LLM model for enrichment (same endpoint as VLM by default)."""
 

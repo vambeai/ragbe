@@ -86,7 +86,7 @@ Return ONLY the corrected markdown of the SECTION provided. Do not include the p
 
 /** Default system prompt for chunk enrichment (mirrors `_CHUNK_SYSTEM` in enrichment_service.py). */
 export const DEFAULT_CHUNK_PROMPT =
-`You are a document analysis specialist. Analyze the provided text chunk and return a JSON object with EXACTLY these fields: "cleaned_chunk" (cleaned normalized text), "title" (short descriptive title), "context" (one sentence describing the surrounding document context), "summary" (one sentence summary), "keywords" (array of keyword strings), "questions" (array of questions this chunk could answer). Return ONLY valid JSON — no commentary, no code fences.`
+`You are a document analysis specialist. Analyze only the provided chunk and return one JSON object with EXACTLY these fields: "cleaned_chunk" (conservatively cleaned and normalized chunk text; preserve facts, numbers, names, and meaning), "title" (short descriptive title for the chunk), "context" (one concise sentence explaining where this chunk fits in the broader document), "summary" (one sentence summary of the chunk content), "keywords" (array of relevant keyword strings, including important named entities, acronyms, products, methods, and domain terms), "questions" (array of realistic user questions answerable primarily from this chunk). If document-summary or surrounding-context blocks are provided, use them only to disambiguate the chunk and improve the context field. Do not copy neighboring text into the output, and do not invent information that is not supported by the chunk. Return ONLY valid JSON — no commentary, no code fences.`
 
 // ---------------------------------------------------------------------------
 // VLM defaults — kept in sync with VLMConverter.__init__ in vlm.py.
@@ -124,6 +124,7 @@ export const DEFAULT_SETTINGS: ChunkSettings = {
   chunkSize: 512,
   chunkOverlap: 51,
   enableMarkdownSizing: false,
+  useFirstMarkdownForBulkChunks: false,
   converter: 'pymupdf',
   vlm: {
     model: DEFAULT_VLM_MODEL,

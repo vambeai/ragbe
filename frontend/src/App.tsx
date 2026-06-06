@@ -420,7 +420,8 @@ export default function App() {
   }, [selectedDoc, refreshDocument, selectMarkdownVersion, settings.converter])
 
   const {
-    bulkOp, bulkConnectionLost, interruptBulk, handleBulkConvert, handleBulkChunk, handleBulkEnrich,
+    bulkOp, bulkConnectionLost, interruptBulk,
+    handleBulkConvert, handleBulkChunk, handleBulkEnrich, handleBulkChunkEnrich,
   } = useBulkOps({
     batchConvert,
     settings,
@@ -676,6 +677,7 @@ export default function App() {
         onBulkConvert={handleBulkConvert}
         onBulkChunk={handleBulkChunk}
         onBulkEnrich={handleBulkEnrich}
+        onBulkChunkEnrich={handleBulkChunkEnrich}
         onOpenSettings={() => setSettingsOpen(true)}
         docsWithMarkdown={docsWithMarkdown}
         docsWithFailures={docsWithFailures}

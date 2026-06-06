@@ -1,10 +1,21 @@
 import { useState, useRef, useCallback } from 'react'
 import type { ChunkSettings, ConverterType, VLMSettings, CloudSettings, Chunk } from '../types'
 import type { BulkProgressFn, BulkResultFn } from './useDocument'
-import { apiEnrichMarkdownPipeline, API_BASE } from '../services/apiService'
+import {
+  apiEnrichChunks,
+  apiEnrichMarkdownPipeline,
+  API_BASE,
+  converterFilenameToken,
+} from '../services/apiService'
 import { listMarkdownVersions } from '../services/markdownsApi'
-import { chunkSse, saveChunks as saveChunksApi } from '../services/chunksApi'
+import {
+  chunkSse,
+  listChunksVersions,
+  loadSavedChunksFile,
+  saveChunks as saveChunksApi,
+} from '../services/chunksApi'
 import { CONNECTION_LOST_MSG } from '../utils/parseSse'
+import { isChunksVersionForSettings, missingEnrichmentModelError } from '../utils/chunkUtils'
 
 /**
  * Priority order used by bulk enrichment when a PDF has multiple
@@ -15,6 +26,35 @@ import { CONNECTION_LOST_MSG } from '../utils/parseSse'
  * silently dropping a file just because its converter was renamed).
  */
 const BULK_ENRICH_CONVERTER_PRIORITY = ['vlm', 'cloud', 'docling', 'markitdown', 'liteparse', 'pymupdf4llm']
+
+async function resolvePreferredMarkdownFilename(filename: string): Promise<string | null> {
+  const versions = await listMarkdownVersions(filename)
+  const converted = versions.filter(v => v.source === 'converted' && v.converter)
+  for (const token of BULK_ENRICH_CONVERTER_PRIORITY) {
+    const hit = converted.find(v => v.converter === token)
+    if (hit) return hit.filename
+  }
+  if (converted.length > 0) return converted[0].filename
+  return versions.find(v => v.source === 'uploaded')?.filename ?? null
+}
+
+async function resolveBulkChunkMarkdownFilename(
+  filename: string,
+  settings: ChunkSettings,
+): Promise<string | null> {
+  const versions = await listMarkdownVersions(filename)
+  if (versions.length === 0) return null
+  if (settings.useFirstMarkdownForBulkChunks) return versions[0].filename
+
+  const token = converterFilenameToken(settings.converter)
+  if (token) {
+    const converted = versions.find(v => v.source === 'converted' && v.converter === token)
+    if (converted) return converted.filename
+  }
+
+  const uploadedOnly = versions.every(v => v.source === 'uploaded')
+  return uploadedOnly ? versions[0].filename : null
+}
 
 export interface BulkOp {
   title: string
@@ -156,14 +196,7 @@ export function useBulkOps({
     let succeeded = 0
     let failed = 0
     let saveFailed = 0
-
-    const onFileStart = (filename: string, index: number, total: number) => {
-      onProgress(index, total, filename)
-      setBulkOp(prev => prev
-        ? { ...prev, detail: `File ${index} of ${total} — ${filename}`, current: index }
-        : null
-      )
-    }
+    let skippedNoMd = 0
 
     // The backend no longer auto-saves chunks during /api/chunk; save must be
     // triggered explicitly by the caller for each successfully chunked file.
@@ -176,42 +209,63 @@ export function useBulkOps({
     // not be silently swallowed: counted separately so the user sees a clear
     // "chunked but not saved" toast at the end (otherwise the success toast
     // misleads them into thinking every file made it to disk).
-    const onFileDone = async (filename: string, success: boolean, chunks: Chunk[], mdFilename: string | null) => {
-      onResult(filename, success)
-      if (success) {
-        succeeded++
+    for (let i = 0; i < filenames.length; i++) {
+      if (signal.aborted) break
+      const filename = filenames[i]
+      const fileIndex = i + 1
+      onProgress(fileIndex, filenames.length, filename)
+      setBulkOp(prev => prev
+        ? { ...prev, detail: `File ${fileIndex} of ${filenames.length} — ${filename}`, current: fileIndex }
+        : null
+      )
+
+      let mdFilename: string | null = null
+      try {
+        mdFilename = await resolveBulkChunkMarkdownFilename(filename, settings)
+      } catch (err) {
+        console.warn(`Bulk chunking: markdown resolution failed for '${filename}':`, err)
+      }
+      if (!mdFilename) {
+        skippedNoMd++
+        onResult(filename, false)
+        continue
+      }
+
+      try {
+        const chunks = await chunkSse(
+          [filename],
+          settings,
+          signal,
+          () => setBulkConnectionLost(true),
+          undefined,
+          undefined,
+          mdFilename,
+        )
         try {
           await saveChunksApi({ filename, mdFilename, settings, chunks })
+          succeeded++
+          onResult(filename, true)
         } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') break
           saveFailed++
           console.warn(`Failed to save chunks for '${filename}':`, err)
+          onResult(filename, false)
         }
-      } else {
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') break
         failed++
-      }
-    }
-
-    try {
-      await chunkSse(
-        filenames,
-        settings,
-        signal,
-        () => setBulkConnectionLost(true),
-        onFileStart,
-        onFileDone,
-      )
-    } catch (err) {
-      if (!(err instanceof DOMException && err.name === 'AbortError')) {
-        showToast(err instanceof Error ? err.message : 'Batch chunking failed', 'error')
+        console.warn(`Bulk chunking failed for '${filename}':`, err)
+        onResult(filename, false)
       }
     }
 
     setBulkOp(null)
     setBulkConnectionLost(false)
-    const persisted = succeeded - saveFailed
+    const persisted = succeeded
     if (persisted > 0) showToast(`Chunked ${persisted} file${persisted > 1 ? 's' : ''} ✓`, 'success')
     if (failed > 0) showToast(`${failed} file${failed > 1 ? 's' : ''} failed to chunk`, 'error')
     if (saveFailed > 0) showToast(`${saveFailed} file${saveFailed > 1 ? 's' : ''} chunked but not saved`, 'error')
+    if (skippedNoMd > 0) showToast(`${skippedNoMd} file${skippedNoMd > 1 ? 's' : ''} skipped — selected Markdown variant not found`, 'error')
   }, [settings, showToast])
 
   // ── Bulk markdown enrichment (Phase C) ───────────────────────────────────
@@ -264,21 +318,9 @@ export function useBulkOps({
         : null
       )
 
-      // Variant resolution — list versions, then pick by priority.
       let mdFilename: string | null = null
       try {
-        const versions = await listMarkdownVersions(filename)
-        const converted = versions.filter(v => v.source === 'converted' && v.converter)
-        for (const token of BULK_ENRICH_CONVERTER_PRIORITY) {
-          const hit = converted.find(v => v.converter === token)
-          if (hit) { mdFilename = hit.filename; break }
-        }
-        if (!mdFilename && converted.length > 0) mdFilename = converted[0].filename
-        if (!mdFilename) {
-          // Bare-uploaded MDs (source: 'uploaded') are also enrichable.
-          const uploaded = versions.find(v => v.source === 'uploaded')
-          if (uploaded) mdFilename = uploaded.filename
-        }
+        mdFilename = await resolvePreferredMarkdownFilename(filename)
       } catch (err) {
         console.warn(`Bulk enrich: variant resolution failed for '${filename}':`, err)
       }
@@ -342,5 +384,173 @@ export function useBulkOps({
     if (skippedNoMd > 0) showToast(`${skippedNoMd} file${skippedNoMd > 1 ? 's' : ''} skipped — no markdown found`, 'error')
   }, [settings.sectionEnrichment, showToast])
 
-  return { bulkOp, bulkConnectionLost, interruptBulk, handleBulkConvert, handleBulkChunk, handleBulkEnrich }
+  const handleBulkChunkEnrich = useCallback(async (
+    filenames: string[],
+    onProgress: BulkProgressFn,
+    onResult: BulkResultFn,
+  ) => {
+    const enrichSettings = settings.chunkEnrichment
+    if (!enrichSettings?.model) {
+      showToast(missingEnrichmentModelError('Chunk Enrichment settings'), 'error')
+      filenames.forEach(f => onResult(f, false))
+      return
+    }
+
+    bulkAbortRef.current?.abort()
+    bulkAbortRef.current = new AbortController()
+    const { signal } = bulkAbortRef.current
+
+    setBulkOp({ title: 'Batch Chunk Enrichment', detail: '', current: 0, total: filenames.length })
+    setBulkConnectionLost(false)
+
+    let succeeded = 0
+    let failed = 0
+    let partial = 0
+    let skippedNoMd = 0
+    let saveFailed = 0
+
+    for (let i = 0; i < filenames.length; i++) {
+      if (signal.aborted) break
+      const filename = filenames[i]
+      const fileIndex = i + 1
+      onProgress(fileIndex, filenames.length, filename)
+      setBulkOp(prev => prev
+        ? { ...prev, current: fileIndex, detail: `File ${fileIndex} of ${filenames.length} — ${filename}` }
+        : null
+      )
+
+      let chunks: Chunk[] | null = null
+      let mdFilename: string | null = null
+
+      try {
+        mdFilename = await resolveBulkChunkMarkdownFilename(filename, settings)
+      } catch (err) {
+        console.warn(`Bulk chunk enrichment: markdown resolution failed for '${filename}':`, err)
+      }
+      if (!mdFilename) {
+        skippedNoMd++
+        onResult(filename, false)
+        continue
+      }
+
+      try {
+        const versions = await listChunksVersions(filename)
+        const matching = versions.find(v =>
+          v.md_filename === mdFilename && isChunksVersionForSettings(v, settings)
+        )
+        if (matching) {
+          setBulkOp(prev => prev
+            ? { ...prev, detail: `File ${fileIndex} of ${filenames.length} — loading saved chunks for ${filename}` }
+            : null
+          )
+          chunks = await loadSavedChunksFile(filename, matching.filename, signal)
+          mdFilename = matching.md_filename
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') break
+        console.warn(`Bulk chunk enrichment: saved chunk lookup failed for '${filename}', will try fresh chunking:`, err)
+        chunks = null
+      }
+
+      if (!chunks) {
+        try {
+          setBulkOp(prev => prev
+            ? { ...prev, detail: `File ${fileIndex} of ${filenames.length} — chunking ${filename}` }
+            : null
+          )
+          chunks = await chunkSse(
+            [filename],
+            settings,
+            signal,
+            () => setBulkConnectionLost(true),
+            undefined,
+            undefined,
+            mdFilename,
+          )
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') break
+          failed++
+          console.warn(`Bulk chunk enrichment: chunking failed for '${filename}':`, err)
+          onResult(filename, false)
+          continue
+        }
+      }
+
+      if (!chunks || chunks.length === 0) {
+        failed++
+        onResult(filename, false)
+        continue
+      }
+
+      try {
+        const result = await apiEnrichChunks(
+          enrichSettings,
+          chunks,
+          mdFilename,
+          signal,
+          ({ current, total }) => {
+            setBulkOp(prev => prev
+              ? {
+                  ...prev,
+                  detail: `File ${fileIndex} of ${filenames.length} — enriching ${current}/${total} chunks (${filename})`,
+                }
+              : null
+            )
+          },
+          () => setBulkConnectionLost(true),
+        )
+
+        if (result.succeeded === 0) {
+          failed++
+          onResult(filename, false)
+          continue
+        }
+
+        const enrichedByIndex = new Map(result.chunks.map(c => [c.index, c]))
+        const merged = chunks.map(c => {
+          const enriched = enrichedByIndex.get(c.index)
+          return enriched ? { ...c, ...enriched } : c
+        })
+
+        try {
+          setBulkOp(prev => prev
+            ? { ...prev, detail: `File ${fileIndex} of ${filenames.length} — saving enriched chunks for ${filename}` }
+            : null
+          )
+          await saveChunksApi({ filename, mdFilename, settings, chunks: merged })
+          succeeded++
+          if (result.failed > 0) partial++
+          onResult(filename, true)
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') break
+          saveFailed++
+          console.warn(`Bulk chunk enrichment: save failed for '${filename}':`, err)
+          onResult(filename, false)
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') break
+        failed++
+        console.warn(`Bulk chunk enrichment failed for '${filename}':`, err)
+        onResult(filename, false)
+      }
+    }
+
+    setBulkOp(null)
+    setBulkConnectionLost(false)
+    if (succeeded > 0) showToast(`Enriched chunks for ${succeeded} file${succeeded > 1 ? 's' : ''} ✓`, 'success')
+    if (partial > 0) showToast(`${partial} file${partial > 1 ? 's' : ''} saved with some chunk failures`, 'error')
+    if (failed > 0) showToast(`${failed} file${failed > 1 ? 's' : ''} failed chunk enrichment`, 'error')
+    if (saveFailed > 0) showToast(`${saveFailed} file${saveFailed > 1 ? 's' : ''} enriched but not saved`, 'error')
+    if (skippedNoMd > 0) showToast(`${skippedNoMd} file${skippedNoMd > 1 ? 's' : ''} skipped — no markdown found`, 'error')
+  }, [settings, settings.chunkEnrichment, showToast])
+
+  return {
+    bulkOp,
+    bulkConnectionLost,
+    interruptBulk,
+    handleBulkConvert,
+    handleBulkChunk,
+    handleBulkEnrich,
+    handleBulkChunkEnrich,
+  }
 }

@@ -30,9 +30,9 @@ out to be unreliable to extract and were dropped along with their
 persistence layer.
 
 Lifecycle:
-    * Created on first markdown-enrichment run (via the SummaryReviewModal
-      → /api/enrich/summary/generate) or on the first chunk-enrichment
-      run that requests it.
+    * Created on first markdown-enrichment run via the SummaryReviewModal
+      → /api/enrich/summary/generate. Chunk enrichment only attaches an
+      existing cached summary; it never generates one on its own.
     * The summary is keyed by the source PDF itself: ``source_hash`` is
       the SHA-256 of the PDF bytes when one exists on disk (the common
       case), or — when only an uploaded ``.md`` exists — of the cleaned

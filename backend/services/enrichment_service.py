@@ -20,6 +20,7 @@ from backend.utils.retry import async_retry_with_backoff
 
 if TYPE_CHECKING:
     from .document_summary import DocumentSummary, PieceExtraction
+    from .chunk_context import ChunkSurroundingContext
 
 logger = logging.getLogger(__name__)
 
@@ -248,15 +249,18 @@ def _build_piece_user_message(
     return "\n\n".join(parts)
 
 _CHUNK_SYSTEM = (
-    "You are a document analysis specialist. Analyze the provided text chunk "
-    "and return a JSON object with EXACTLY these fields: "
-    '"cleaned_chunk" (cleaned normalized text), '
-    '"title" (short descriptive title), '
-    '"context" (one sentence describing the surrounding document context), '
-    '"summary" (one sentence summary), '
-    '"keywords" (array of keyword strings), '
-    '"questions" (array of questions this chunk could answer). '
-    "Return ONLY valid JSON — no commentary, no code fences."
+    "You are a document analysis specialist. Analyze only the provided chunk "
+    "and return one JSON object with EXACTLY these fields: "
+    '"cleaned_chunk" (conservatively cleaned and normalized chunk text; preserve facts, numbers, names, and meaning), '
+    '"title" (short descriptive title for the chunk), '
+    '"context" (one concise sentence explaining where this chunk fits in the broader document), '
+    '"summary" (one sentence summary of the chunk content), '
+    '"keywords" (array of relevant keyword strings, including important named entities, acronyms, products, methods, and domain terms), '
+    '"questions" (array of realistic user questions answerable primarily from this chunk). '
+    "If document-summary or surrounding-context blocks are provided, use them "
+    "only to disambiguate the chunk and improve the context field. Do not copy "
+    "neighboring text into the output, and do not invent information that is not "
+    "supported by the chunk. Return ONLY valid JSON — no commentary, no code fences."
 )
 
 # Same task and JSON shape as ``_CHUNK_SYSTEM``, but with one extra
@@ -267,11 +271,38 @@ _CHUNK_SYSTEM = (
 _CHUNK_SYSTEM_WITH_SUMMARY = (
     _CHUNK_SYSTEM
     + "\n\nThe user message begins with a <<<DOCUMENT SUMMARY>>> block "
-    "describing what the document as a whole is about (topic, key "
-    "entities, key terms, structure).  Use it to disambiguate proper "
-    "nouns and to write a more accurate ``context`` field — but never "
-    "use it to invent information that is not present in the chunk."
+    "describing the document-level topic and narrative. Use it to "
+    "disambiguate proper nouns and to write a more accurate ``context`` "
+    "field — but never use it to invent information that is not present "
+    "in the chunk."
 )
+
+
+def _build_chunk_user_message(
+    content: str,
+    *,
+    document_summary_block: str = "",
+    surrounding_context_block: str = "",
+) -> str:
+    parts: list[str] = []
+    if document_summary_block:
+        parts.append(
+            "<<<DOCUMENT SUMMARY — for context only, do not include in your output>>>\n"
+            f"{document_summary_block}\n"
+            "<<<END DOCUMENT SUMMARY>>>"
+        )
+    if surrounding_context_block:
+        parts.append(
+            "<<<SURROUNDING CONTEXT — for context only, do not include in your output>>>\n"
+            f"{surrounding_context_block}\n"
+            "<<<END SURROUNDING CONTEXT>>>"
+        )
+    parts.append(
+        "<<<CHUNK TO ANALYSE>>>\n"
+        f"{content}\n"
+        "<<<END CHUNK TO ANALYSE>>>"
+    )
+    return "\n\n".join(parts)
 
 
 class EnrichmentService:
@@ -675,6 +706,7 @@ class EnrichmentService:
         self,
         content: str,
         document_summary: "DocumentSummary | None" = None,
+        surrounding_context: "ChunkSurroundingContext | None" = None,
     ) -> dict[str, Any]:
         """Enrich a single chunk and return a dict of enriched fields.
 
@@ -688,6 +720,10 @@ class EnrichmentService:
                                ``context`` field and disambiguate proper
                                nouns.  Has no effect when ``None`` or
                                empty.
+            surrounding_context:
+                               Optional source-markdown text immediately
+                               before / after this chunk. Used only as
+                               read-only context for disambiguation.
 
         Returns:
             Dict with keys: cleaned_chunk, title, context, summary,
@@ -711,18 +747,23 @@ class EnrichmentService:
                 and not self._user_prompt
             else ""
         )
+        surrounding_context_block = (
+            surrounding_context.to_prompt_block()
+            if surrounding_context is not None
+                and not surrounding_context.is_empty()
+                and not self._user_prompt
+            else ""
+        )
         system_content = self.effective_chunk_system_prompt(with_summary=bool(summary_block))
-        if summary_block:
-            user_content = (
-                "<<<DOCUMENT SUMMARY — for context only, do not include in your output>>>\n"
-                f"{summary_block}\n"
-                "<<<END DOCUMENT SUMMARY>>>\n\n"
-                "<<<CHUNK TO ANALYSE>>>\n"
-                f"{content}\n"
-                "<<<END CHUNK TO ANALYSE>>>"
+        user_content = (
+            _build_chunk_user_message(
+                content,
+                document_summary_block=summary_block,
+                surrounding_context_block=surrounding_context_block,
             )
-        else:
-            user_content = content
+            if summary_block or surrounding_context_block
+            else content
+        )
         response = await self._complete([
             {"role": "system", "content": system_content},
             {"role": "user", "content": user_content},

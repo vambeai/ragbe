@@ -25,6 +25,11 @@ interface Props {
    * by the handler (mirrors the Chunk button's behaviour).
    */
   onBulkEnrich?: (filenames: string[], onProgress: BulkProgressFn, onResult: BulkResultFn) => Promise<void>
+  /**
+   * Optional bulk chunk enrichment.  Enriches saved chunks for each selected
+   * document, or chunks first when no matching saved set exists.
+   */
+  onBulkChunkEnrich?: (filenames: string[], onProgress: BulkProgressFn, onResult: BulkResultFn) => Promise<void>
   onOpenSettings?: () => void
   docsWithMarkdown?: Set<string>
   /**
@@ -36,7 +41,7 @@ interface Props {
 }
 
 interface BulkOpState {
-  type: 'convert' | 'chunk' | 'enrich'
+  type: 'convert' | 'chunk' | 'enrich' | 'chunk-enrich'
   current: number
   total: number
   currentFile: string
@@ -46,7 +51,7 @@ interface BulkOpState {
 export default function Sidebar({
   documents, selectedDoc, onSelect, onUpload, uploading,
   collapsed, onToggleCollapse, onDelete,
-  onBulkConvert, onBulkChunk, onBulkEnrich,
+  onBulkConvert, onBulkChunk, onBulkEnrich, onBulkChunkEnrich,
   onOpenSettings, docsWithMarkdown, docsWithFailures,
 }: Props) {
   const [search, setSearch] = useState('')
@@ -275,7 +280,7 @@ export default function Sidebar({
                   </button>
                 </div>
 
-                {(onBulkConvert || onBulkChunk || onBulkEnrich) && (
+                {(onBulkConvert || onBulkChunk || onBulkEnrich || onBulkChunkEnrich) && (
                   <div className="bulk-actions bulk-actions-secondary">
                     {onBulkConvert && (
                       <button
@@ -314,7 +319,22 @@ export default function Sidebar({
                         >
                           {bulkOp?.type === 'enrich'
                             ? `⏳ ${bulkOp.current}/${bulkOp.total}`
-                            : `✨ Enrich${enrichable > 0 ? ` (${enrichable})` : ''}`}
+                            : `✨ Enrich MD${enrichable > 0 ? ` (${enrichable})` : ''}`}
+                        </button>
+                      )
+                    })()}
+                    {onBulkChunkEnrich && (() => {
+                      const enrichable = Array.from(selected).filter(f => docsWithMarkdown?.has(f)).length
+                      return (
+                        <button
+                          className="bulk-btn chunk-enrich-selected"
+                          onClick={() => runBulkOp('chunk-enrich', onBulkChunkEnrich)}
+                          disabled={enrichable === 0 || isBusy}
+                          title={selected.size > enrichable ? `${selected.size - enrichable} selected file(s) have no markdown and will be skipped` : 'Enrich saved chunks, or chunk first when no matching saved chunks exist.'}
+                        >
+                          {bulkOp?.type === 'chunk-enrich'
+                            ? `⏳ ${bulkOp.current}/${bulkOp.total}`
+                            : `✨ Enrich Chunks${enrichable > 0 ? ` (${enrichable})` : ''}`}
                         </button>
                       )
                     })()}
@@ -325,7 +345,8 @@ export default function Sidebar({
                   <div className="bulk-progress">
                     <span className="bulk-progress-label">
                       {bulkOp.type === 'convert' ? 'Converting' :
-                        bulkOp.type === 'chunk' ? 'Chunking' : 'Enriching'}{' '}
+                        bulkOp.type === 'chunk' ? 'Chunking' :
+                          bulkOp.type === 'chunk-enrich' ? 'Enriching chunks' : 'Enriching markdown'}{' '}
                       {bulkOp.current}/{bulkOp.total}
                     </span>
                     {bulkOp.currentFile && (

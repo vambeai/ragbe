@@ -1,10 +1,12 @@
 import type {
   Capabilities,
+  Chunk,
   DocumentSummary,
   DocumentSummaryResponse,
   EnrichmentSettings,
 } from '../types'
 import { parseSse } from '../utils/parseSse'
+import { normaliseChunk } from '../utils/chunkUtils'
 import { DEFAULT_ENRICHMENT_BASE_URL, DEFAULT_ENRICHMENT_TEMPERATURE } from '../hooks/useSettings'
 import { METADATA_FETCH_TIMEOUT_MS } from '../config'
 
@@ -164,6 +166,21 @@ export interface PipelineResult {
   }
 }
 
+export interface ChunkEnrichmentProgress {
+  current: number
+  total: number
+  chunk?: Chunk
+}
+
+export type ChunkEnrichmentInput = Pick<Chunk, 'index' | 'content'> &
+  Partial<Pick<Chunk, 'start' | 'end' | 'metadata'>>
+
+export interface ChunkEnrichmentBatchResult {
+  chunks: Chunk[]
+  succeeded: number
+  failed: number
+}
+
 /**
  * Run the full enrichment pipeline (regex + structure-aware split +
  * per-piece LLM with rolling context + per-piece checkpoint) on a stored
@@ -268,17 +285,45 @@ export async function apiEnrichChunk(
   onConnectionLost?: () => void,
   mdFilename?: string,
 ): Promise<Record<string, unknown>> {
-  // ``mdFilename`` enables Phase B: backend looks up the cached
-  // document summary for the corresponding PDF and attaches it to
-  // every chunk-enrichment prompt as document-level context.  Absent
-  // (or no cached summary): chunks are enriched in isolation, same
-  // behaviour as before the feature.
+  const result = await apiEnrichChunks(
+    settings,
+    [{ index, content, start, end, metadata }],
+    mdFilename,
+    signal,
+    undefined,
+    onConnectionLost,
+  )
+  if (result.chunks.length > 0) return result.chunks[0] as unknown as Record<string, unknown>
+  throw new Error('Chunk enrichment produced no result')
+}
+
+/**
+ * Enrich one or more chunks via SSE.
+ *
+ * ``mdFilename`` lets the backend attach cached document summary and source
+ * Markdown context windows.  Absent (or no cached context): chunks are
+ * enriched in isolation.
+ */
+export async function apiEnrichChunks(
+  settings: EnrichmentSettings,
+  chunks: ChunkEnrichmentInput[],
+  mdFilename?: string | null,
+  signal?: AbortSignal,
+  onProgress?: (progress: ChunkEnrichmentProgress) => void,
+  onConnectionLost?: () => void,
+): Promise<ChunkEnrichmentBatchResult> {
   const res = await fetch(`${API_BASE}/enrich/chunks`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     signal,
     body: JSON.stringify(buildEnrichmentBody(settings, {
-      chunks: [{ index, content, start, end, metadata }],
+      chunks: chunks.map(c => ({
+        index: c.index,
+        content: c.content,
+        start: c.start ?? 0,
+        end: c.end ?? 0,
+        metadata: c.metadata ?? {},
+      })),
       ...(mdFilename ? { md_filename: mdFilename } : {}),
     })),
   })
@@ -287,8 +332,32 @@ export async function apiEnrichChunk(
     throw new Error(`Chunk enrichment failed ${res.status}: ${errText}`)
   }
   if (!res.body) throw new Error('No response body')
+  const enriched: Chunk[] = []
+  let succeeded = 0
+  let failed = 0
   for await (const event of parseSse(res.body, onConnectionLost)) {
-    if (event.type === 'chunk_done') return event.chunk as Record<string, unknown>
+    if (event.type === 'chunk_done') {
+      succeeded++
+      const chunk = normaliseChunk(event.chunk as Partial<Chunk> & { index: number; content: string })
+      enriched.push(chunk)
+      onProgress?.({
+        current: (event.current as number) ?? succeeded + failed,
+        total: (event.total as number) ?? chunks.length,
+        chunk,
+      })
+    } else if (event.type === 'chunk_error') {
+      failed++
+      onProgress?.({
+        current: (event.current as number) ?? succeeded + failed,
+        total: (event.total as number) ?? chunks.length,
+      })
+    } else if (event.type === 'done') {
+      return {
+        chunks: enriched,
+        succeeded: (event.succeeded as number | undefined) ?? succeeded,
+        failed: chunks.length - ((event.succeeded as number | undefined) ?? succeeded),
+      }
+    }
     if (event.type === 'error') throw new Error(String(event.message ?? 'Chunk enrichment error'))
     if (event.type === 'cancelled') throw new DOMException('Chunk enrichment cancelled', 'AbortError')
   }

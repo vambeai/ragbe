@@ -338,6 +338,21 @@ export default function SettingsModal({ isOpen, onClose, onSave, current }: Prop
                   {!isSizeDisabled && isOverlapDisabled && (
                     <small className="size-hint">This chunker does not support chunk overlap.</small>
                   )}
+
+                  <div className="form-group checkbox-group">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={settings.useFirstMarkdownForBulkChunks}
+                        onChange={e => set('useFirstMarkdownForBulkChunks', e.target.checked)}
+                      />
+                      Use first available Markdown for bulk chunking
+                    </label>
+                    <small>
+                      When disabled, bulk chunking and bulk chunk enrichment use the Markdown
+                      variant matching the selected converter.
+                    </small>
+                  </div>
                 </>
               )}
 

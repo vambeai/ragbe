@@ -61,12 +61,13 @@ from backend.services.document_summary import (
     get_or_generate_summary,
     save_user_edit,
 )
+from backend.services.chunk_context import build_chunk_surrounding_context
 from backend.services.enrichment_checkpoint import EnrichmentCheckpointStore
 from backend.services.enrichment_pipeline import run_enrichment_pipeline
 from backend.services.enrichment_service import EnrichmentService
 from backend.utils.markdown import clean_markdown, split_markdown
 from backend.utils.naming import doc_stem_from_md
-from backend.utils.path import safe_filename
+from backend.utils.path import safe_child_path, safe_filename
 from backend.utils.sse import (
     run_sse_event_loop,
     sse_error as _sse_error,
@@ -127,6 +128,8 @@ async def enrich_chunks(http_request: Request, body: EnrichChunksRequest):
         # review modal.  Failures here degrade silently (chunks proceed
         # without context); never abort the whole batch.
         document_summary = None
+        source_markdown = ""
+        md_name = None
         if body.md_filename:
             try:
                 md_name = safe_filename(body.md_filename, "Markdown filename")
@@ -141,6 +144,17 @@ async def enrich_chunks(http_request: Request, body: EnrichChunksRequest):
                 )
 
         _settings = get_settings()
+        if md_name:
+            try:
+                md_path = safe_child_path(_doc_svc._mds_dir, md_name, description="Markdown filename")
+                if md_path.is_file():
+                    source_markdown = md_path.read_text(encoding="utf-8")
+            except Exception as exc:  # noqa: BLE001 — silent degradation
+                logger.warning(
+                    "Chunk enrichment: failed to load source markdown for %r — continuing without surrounding context: %s",
+                    body.md_filename, exc,
+                )
+
         watchdog_s = _settings.SSE_WATCHDOG_TIMEOUT_S
         queue_timeout_s = _settings.SSE_QUEUE_GET_TIMEOUT_S
         # Use the global semaphore from app.state so the cap is enforced across
@@ -156,7 +170,22 @@ async def enrich_chunks(http_request: Request, body: EnrichChunksRequest):
             content = chunk.get("content", "")
             async with semaphore:
                 try:
-                    enriched = await svc.enrich_chunk(content, document_summary=document_summary)
+                    surrounding_context = (
+                        build_chunk_surrounding_context(
+                            source_markdown,
+                            content=content,
+                            start=int(chunk.get("start", 0) or 0),
+                            end=int(chunk.get("end", 0) or 0),
+                            before_chars=_settings.ENRICHMENT_CHUNK_CONTEXT_BEFORE_CHARS,
+                            after_chars=_settings.ENRICHMENT_CHUNK_CONTEXT_AFTER_CHARS,
+                        )
+                        if source_markdown else None
+                    )
+                    enriched = await svc.enrich_chunk(
+                        content,
+                        document_summary=document_summary,
+                        surrounding_context=surrounding_context,
+                    )
                     _kw = enriched.get("keywords", [])
                     _qs = enriched.get("questions", [])
                     result = {

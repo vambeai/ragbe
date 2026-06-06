@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import type { Chunk, EnrichmentSettings, EnrichOp } from '../types'
-import { apiEnrichChunk, buildEnrichmentBody, API_BASE } from '../services/apiService'
-import { parseSse, CONNECTION_LOST_MSG } from '../utils/parseSse'
+import { apiEnrichChunk, apiEnrichChunks } from '../services/apiService'
+import { CONNECTION_LOST_MSG } from '../utils/parseSse'
 import { missingEnrichmentModelError } from '../utils/chunkUtils'
 
 // ── Hook ─────────────────────────────────────────────────────────────────────
@@ -206,34 +206,21 @@ export function useChunkEnrichment({
     let wasAborted = false
 
     try {
-      const res = await fetch(`${API_BASE}/enrich/chunks`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: abortCtrl.signal,
-        body: JSON.stringify(buildEnrichmentBody(chunkEnrichment, {
-          chunks: chunksToEnrich,
-          ...(mdFilename ? { md_filename: mdFilename } : {}),
-        })),
-      })
-      if (!res.ok) {
-        const errText = await res.text().catch(() => res.statusText)
-        throw new Error(`HTTP ${res.status}: ${errText}`)
-      }
-
-      if (!res.body) throw new Error('No response body')
-      for await (const event of parseSse(
-        res.body,
-        () => setChunkEnrichOp(prev => prev ? { ...prev, errorMessage: CONNECTION_LOST_MSG } : null),
-      )) {
-        if (event.type === 'chunk_done') {
+      const result = await apiEnrichChunks(
+        chunkEnrichment,
+        chunksToEnrich,
+        mdFilename,
+        abortCtrl.signal,
+        ({ current, total, chunk }) => {
+          if (!chunk) {
+            setChunkEnrichOp(prev => prev
+              ? { ...prev, current, detail: `Enriched ${current} of ${total} chunks` }
+              : null
+            )
+            return
+          }
           enrichedCount++
-          const chunk = event.chunk as Record<string, unknown>
-          // chunk.index = which chunk in the full array was enriched (may be out of order)
-          const chunkIndex = chunk.index as number
-          // event.current / event.total = sequential backend counter (always in order)
-          const current = event.current as number
-          const total = event.total as number
-
+          const chunkIndex = chunk.index
           const latestChunks = chunksRef.current
           onEnrichChunk(chunkIndex, {
             cleaned_chunk: typeof chunk.cleaned_chunk === 'string' ? chunk.cleaned_chunk : (latestChunks?.[chunkIndex]?.cleaned_chunk ?? ''),
@@ -241,31 +228,20 @@ export function useChunkEnrichment({
             context: typeof chunk.context === 'string' ? chunk.context : (latestChunks?.[chunkIndex]?.context ?? ''),
             summary: typeof chunk.summary === 'string' ? chunk.summary : (latestChunks?.[chunkIndex]?.summary ?? ''),
             keywords: Array.isArray(chunk.keywords)
-              ? chunk.keywords as string[]
+              ? chunk.keywords
               : latestChunks?.[chunkIndex]?.keywords ?? [],
             questions: Array.isArray(chunk.questions)
-              ? chunk.questions as string[]
+              ? chunk.questions
               : latestChunks?.[chunkIndex]?.questions ?? [],
           })
           setChunkEnrichOp(prev => prev
             ? { ...prev, current, detail: `Enriched ${current} of ${total} chunks` }
             : null
           )
-          // Yield to the event loop so React flushes state between consecutive events
-          // (React 18 automatic batching would otherwise collapse all updates to one render).
-          await new Promise<void>(r => setTimeout(r, 0))
-
-        } else if (event.type === 'chunk_error') {
-          setChunkEnrichOp(prev => prev
-            ? { ...prev, current: event.current as number, detail: `Enriched ${event.current} of ${event.total} chunks` }
-            : null
-          )
-        } else if (event.type === 'done' || event.type === 'cancelled') {
-          break
-        } else if (event.type === 'error') {
-          throw new Error(String(event.message ?? 'Enrichment error'))
-        }
-      }
+        },
+        () => setChunkEnrichOp(prev => prev ? { ...prev, errorMessage: CONNECTION_LOST_MSG } : null),
+      )
+      enrichedCount = result.succeeded
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         wasAborted = true

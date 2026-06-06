@@ -294,7 +294,7 @@
   transform: none;
 }
 
-/* The secondary row carries 2-3 buttons (Convert / Chunk / Enrich).
+/* The secondary row carries several bulk actions.
    Three full-width pill buttons don't fit in a sidebar of typical width
    (the labels include the selection count, so they don't compress
    cleanly with white-space: nowrap).  Allow wrapping with a 2-per-row
@@ -308,6 +308,8 @@
 .bulk-actions-secondary .bulk-btn {
   flex: 1 1 calc(50% - 4px);
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .bulk-btn.convert-selected {
@@ -345,6 +347,17 @@
 .bulk-btn.enrich-selected:hover:not(:disabled) {
   transform: translateY(-1px);
   box-shadow: 0 4px 10px rgba(139, 69, 19, 0.35);
+}
+
+.bulk-btn.chunk-enrich-selected {
+  background: linear-gradient(135deg, #6E3A8A 0%, #9A5CC2 100%);
+  color: white;
+  box-shadow: 0 2px 6px rgba(110, 58, 138, 0.25);
+}
+
+.bulk-btn.chunk-enrich-selected:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(110, 58, 138, 0.35);
 }
 
 /* ── Bulk progress ── */

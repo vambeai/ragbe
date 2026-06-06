@@ -87,8 +87,24 @@ export function findMatchingSavedChunks(
   mdSource: string | null,
   settings: ChunkSettings,
 ): ChunksVersion | undefined {
-  return versions.find(v =>
-    v.md_source === mdSource &&
+  return versions.find(v => v.md_source === mdSource && isChunksVersionForSettings(v, settings))
+}
+
+/** True when a saved chunks version was produced by the active chunker config. */
+export function isChunksVersionForSettings(v: ChunksVersion, settings: ChunkSettings): boolean {
+  if (
+    v.library === 'langchain' &&
+    v.algorithm === 'markdown' &&
+    settings.chunkerLibrary === 'langchain' &&
+    settings.chunkerType === 'markdown'
+  ) {
+    if (settings.enableMarkdownSizing) {
+      return v.chunk_size === settings.chunkSize && v.chunk_overlap === settings.chunkOverlap
+    }
+    return v.chunk_size === null && v.chunk_overlap === null
+  }
+
+  return (
     v.library === settings.chunkerLibrary &&
     v.algorithm === settings.chunkerType &&
     (v.chunk_size === null || v.chunk_size === settings.chunkSize) &&

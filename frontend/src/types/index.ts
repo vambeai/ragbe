@@ -132,6 +132,7 @@ export interface ChunkSettings {
   chunkSize: number
   chunkOverlap: number
   enableMarkdownSizing: boolean
+  useFirstMarkdownForBulkChunks: boolean
   converter: ConverterType
   vlm?: VLMSettings
   cloud?: CloudSettings
