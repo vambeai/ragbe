@@ -115,11 +115,6 @@ async def enrich_chunks(http_request: Request, body: EnrichChunksRequest):
         chunks = [c.model_dump() for c in body.chunks]
         total = len(chunks)
 
-        if total == 0:
-            yield _sse({"type": "start", "operation": "enrich_chunks", "total": 0})
-            yield _sse({"type": "done", "operation": "enrich_chunks", "total_chunks": 0, "succeeded": 0})
-            return
-
         # Silent summary attachment (Phase B): if the caller passed
         # ``md_filename`` AND a per-PDF summary exists on disk, attach
         # it to every chunk-enrichment prompt as document-level context.

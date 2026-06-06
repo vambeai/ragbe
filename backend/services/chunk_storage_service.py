@@ -120,6 +120,37 @@ def _parse_chunk_filename(
     return md_source, library or "unknown", algorithm or "unknown", size, overlap
 
 
+def _as_str(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        item = value.strip()
+        return [item] if item else []
+    if isinstance(value, (list, tuple, set)):
+        items: list[str] = []
+        for raw in value:
+            item = _as_str(raw).strip()
+            if item:
+                items.append(item)
+        return items
+    return []
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _normalise_chunk(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalise a chunk dict to snake_case, filling missing enrichment fields.
 
@@ -127,17 +158,17 @@ def _normalise_chunk(raw: dict[str, Any]) -> dict[str, Any]:
     on incoming request data (write path) and on stored JSON (read path).
     """
     return {
-        "index": raw.get("index", 0),
-        "content": raw.get("content", raw.get("Chunk", "")),
-        "cleaned_chunk": raw.get("cleaned_chunk", raw.get("CleanedChunk", "")),
-        "title": raw.get("title", raw.get("Title", "")),
-        "context": raw.get("context", raw.get("Context", "")),
-        "summary": raw.get("summary", raw.get("Summary", "")),
-        "keywords": raw.get("keywords", raw.get("Keywords", [])),
-        "questions": raw.get("questions", raw.get("Questions", [])),
-        "metadata": raw.get("metadata", {}),
-        "start": raw.get("start", 0),
-        "end": raw.get("end", 0),
+        "index": _as_int(raw.get("index", 0)),
+        "content": _as_str(raw.get("content", raw.get("Chunk", ""))),
+        "cleaned_chunk": _as_str(raw.get("cleaned_chunk", raw.get("CleanedChunk", ""))),
+        "title": _as_str(raw.get("title", raw.get("Title", ""))),
+        "context": _as_str(raw.get("context", raw.get("Context", ""))),
+        "summary": _as_str(raw.get("summary", raw.get("Summary", ""))),
+        "keywords": _as_str_list(raw.get("keywords", raw.get("Keywords", []))),
+        "questions": _as_str_list(raw.get("questions", raw.get("Questions", []))),
+        "metadata": _as_dict(raw.get("metadata", {})),
+        "start": _as_int(raw.get("start", 0)),
+        "end": _as_int(raw.get("end", 0)),
     }
 
 

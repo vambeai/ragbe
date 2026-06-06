@@ -63,12 +63,10 @@ from backend.services.document_service import (
     DocumentService,
     _init_cpu_worker,
     convert_in_process,
-    convert_md_to_pdf_in_process,
 )
 from backend.utils.executor import cancel_cpu_executor
 from backend.utils.sse import (
     run_sse_event_loop,
-    sse_error as _sse_error,
     sse_event as _sse,
 )
 

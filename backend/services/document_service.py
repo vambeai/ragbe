@@ -88,20 +88,23 @@ def _md_files_for_stem(mds_dir: Path, stem: str) -> list[Path]:
     """
     if not mds_dir.exists():
         return []
-    matches: list[Path] = []
-    for f in mds_dir.glob(f"{stem}*.md"):
-        if f.stem == stem:
-            matches.append(f)
-            continue
-        suffix = f.stem[len(stem):]
-        if not suffix.startswith("_"):
-            continue
-        token = suffix[1:]
-        # Only count it as belonging to *stem* if the suffix matches a known
-        # converter — otherwise the file just happens to share the prefix.
-        if token in _KNOWN_CONVERTERS:
-            matches.append(f)
-    return matches
+    return [
+        f for f in mds_dir.glob(f"{stem}*.md")
+        if _markdown_belongs_to_stem(f, stem)
+    ]
+
+
+def _markdown_belongs_to_stem(md_file: Path, stem: str) -> bool:
+    """Return True only for the exact upload or a known converted variant."""
+    if md_file.suffix.lower() != ".md":
+        return False
+    if md_file.stem == stem:
+        return True
+    prefix = f"{stem}_"
+    if not md_file.stem.startswith(prefix):
+        return False
+    token = md_file.stem[len(prefix):]
+    return token in _KNOWN_CONVERTERS
 
 
 def find_markdown_for_document(
@@ -123,13 +126,13 @@ def find_markdown_for_document(
     # mds_dir AND belongs to the same document stem (defends against
     # path-traversal and cross-document leakage).
     if md_filename:
-        candidate = mds_dir / md_filename
-        if candidate.exists() and candidate.parent == mds_dir and candidate.stem.startswith(stem):
+        candidate = safe_child_path(mds_dir, md_filename, description="Markdown filename")
+        if candidate.exists() and _markdown_belongs_to_stem(candidate, stem):
             return candidate
 
     # If the input itself is an .md filename, prefer that exact file.
     direct = mds_dir / filename if filename.lower().endswith(".md") else None
-    if direct is not None and direct.exists():
+    if direct is not None and direct.exists() and _markdown_belongs_to_stem(direct, stem):
         return direct
 
     candidates = _md_files_for_stem(mds_dir, stem)
@@ -173,13 +176,6 @@ def convert_in_process(filename: str, converter_type: ConverterType) -> ConvertR
     if _worker_svc is None:
         raise RuntimeError("Worker process not initialised — _init_cpu_worker did not complete")
     return _worker_svc.convert_to_markdown(filename, converter_type=converter_type)
-
-
-def convert_md_to_pdf_in_process(md_filename: str) -> MdToPdfResponse:
-    """Run a Markdown→PDF conversion in a worker process."""
-    if _worker_svc is None:
-        raise RuntimeError("Worker process not initialised — _init_cpu_worker did not complete")
-    return _worker_svc.convert_md_to_pdf(md_filename)
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +431,7 @@ class DocumentService:
 
         versions: list[MarkdownVersion] = []
         # Converted variants
-        for converter in _KNOWN_CONVERTERS:
+        for converter in sorted(_KNOWN_CONVERTERS):
             candidate = self._mds_dir / f"{stem}_{converter}.md"
             if candidate.exists():
                 versions.append(MarkdownVersion(
@@ -446,10 +442,9 @@ class DocumentService:
                     has_failures=_file_has_failure_markers(candidate),
                 ))
 
-        # Uploaded / legacy: any .md whose name does not match the converter
-        # suffix pattern but starts with the stem.  This covers both the
-        # exact-match case ({stem}.md) and idiosyncratic uploaded filenames
-        # that share the stem.
+        # Uploaded / legacy: only the exact ``{stem}.md`` file.  Other files
+        # that merely share the prefix (``report_notes.md``, ``report2.md``)
+        # are separate documents, not versions of this one.
         for f in sorted(self._mds_dir.glob(f"{stem}*.md")):
             if f.stem == stem:
                 versions.append(MarkdownVersion(
@@ -460,19 +455,6 @@ class DocumentService:
                     has_failures=_file_has_failure_markers(f),
                 ))
                 continue
-            suffix = f.stem[len(stem):]
-            if suffix.startswith("_") and suffix[1:] in _KNOWN_CONVERTERS:
-                continue
-            # Anything else with the stem prefix that wasn't picked up above
-            # is treated as uploaded so the user still sees it.
-            if f.stem.startswith(stem):
-                versions.append(MarkdownVersion(
-                    filename=f.name,
-                    source="uploaded",
-                    converter=None,
-                    file_path=str(f),
-                    has_failures=_file_has_failure_markers(f),
-                ))
 
         return versions
 
@@ -500,7 +482,7 @@ class DocumentService:
         # 2) Direct filename lookup
         if identifier.endswith(".md"):
             candidate = safe_child_path(self._mds_dir, identifier, description="identifier")
-            if candidate.exists() and candidate.stem.startswith(stem):
+            if candidate.exists() and _markdown_belongs_to_stem(candidate, stem):
                 # Determine source from the filename pattern
                 suffix = candidate.stem[len(stem):]
                 if suffix.startswith("_") and suffix[1:] in _KNOWN_CONVERTERS:

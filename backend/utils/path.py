@@ -63,7 +63,7 @@ def safe_stem(filename: str) -> str:
         name = Path(filename).name
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail=f"Invalid filename '{filename}'.")
-    if not name or name in (".", ".."):
+    if not name or name != filename or name in (".", ".."):
         raise HTTPException(
             status_code=400,
             detail=f"Invalid filename '{filename}': path traversal is not allowed.",

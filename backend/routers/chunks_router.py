@@ -54,7 +54,6 @@ from backend.services.chunking_service import _init_chunk_worker, chunk_file_in_
 from backend.utils.executor import cancel_cpu_executor
 from backend.utils.sse import (
     run_sse_event_loop,
-    sse_error as _sse_error,
     sse_event as _sse,
 )
 

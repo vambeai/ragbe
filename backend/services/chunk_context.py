@@ -42,10 +42,10 @@ def build_chunk_surrounding_context(
 ) -> ChunkSurroundingContext:
     """Return paragraph-trimmed markdown before and after a chunk.
 
-    Offsets are trusted when they are in range.  If they are stale or missing,
-    the helper tries an exact content lookup.  When neither path is possible,
-    it returns an empty context instead of raising; enrichment should degrade
-    to the old isolated-chunk behavior.
+    Offsets are trusted only when they still match the chunk content.  If they
+    are stale or missing, the helper tries an exact content lookup.  When
+    neither path is possible, it returns an empty context instead of attaching
+    unrelated surrounding text.
     """
 
     resolved = _resolve_offsets(markdown, content=content, start=start, end=end)
@@ -75,9 +75,6 @@ def _resolve_offsets(
         located = markdown.find(content)
         if located != -1:
             return located, located + len(content)
-
-    if _valid_range(markdown, start, end):
-        return start, end
 
     return None
 
