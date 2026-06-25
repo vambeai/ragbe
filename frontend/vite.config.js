@@ -10,6 +10,9 @@ export default defineConfig(({ command }) => ({
   server: {
     port: 5173,
     host: true,
+    // The dev server runs behind Railway's public host, which Vite blocks by
+    // default. Allow any Railway subdomain; add custom domains to this list.
+    allowedHosts: ['.up.railway.app'],
     proxy: {
       '/api': {
         target: process.env.VITE_API_URL || 'http://localhost:8000',
